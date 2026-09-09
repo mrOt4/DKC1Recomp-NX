@@ -43,9 +43,19 @@
 #include "windows_compat.h"
 #include "windows_platform.h"
 #else
+#ifdef __APPLE__
 #include <mach/mach_time.h>
+#endif
 #include <pthread.h>
 #include <unistd.h>
+#endif
+#ifdef __SWITCH__
+/* Switch platform bring-up + SD ROM resolver (framework) and the raw
+ * joystick gamepad path (this directory). The Dkc1Mac* surface used
+ * below comes from runner/switch_platform.c on Switch. */
+#include "switch_gamepad.h"
+#include "switch_impl.h"
+#include <switch.h>
 #endif
 #include <stdbool.h>
 #include <stdint.h>
@@ -281,7 +291,13 @@ static int RunStartupScript(char *error, size_t error_size) {
 }
 
 static double FramePacerNow(void) {
+#ifdef __SWITCH__
+  /* SDL performance counter as nanoseconds (no Mach clock on Horizon). */
+  return (double)SDL_GetPerformanceCounter() * 1000000000.0 /
+         (double)SDL_GetPerformanceFrequency();
+#else
   return (double)mach_absolute_time();
+#endif
 }
 
 static void FramePacerCpuRelax(void) {
@@ -301,15 +317,40 @@ static void FramePacerCpuRelax(void) {
  * millisecond sleeps still accumulate phase error, so keep the deadline
  * absolute and absorb only the observed final-wake variance here. */
 static void FramePacerWaitUntil(double deadline, double frequency) {
+#ifdef __SWITCH__
+  for (;;) {
+    double now = FramePacerNow();
+    uint64_t remaining_ns;
+    if (now >= deadline) return;
+    remaining_ns = (uint64_t)(deadline - now);
+    if (remaining_ns > 2000000u)
+      SDL_Delay((Uint32)(remaining_ns / 1000000u) - 1u);
+    else
+      FramePacerCpuRelax();
+  }
+#else
   const double spin_ticks = frequency * kMacFinalSpinSeconds;
   double now = FramePacerNow();
   if (deadline - now > spin_ticks)
     (void)mach_wait_until((uint64_t)(deadline - spin_ticks));
   while (FramePacerNow() < deadline)
     FramePacerCpuRelax();
+#endif
 }
 
 static void FramePacerInit(Dkc1FramePacer *pacer) {
+#ifdef __SWITCH__
+  /* SDL nanosecond clock; same shape as the Mach init below. */
+  memset(pacer, 0, sizeof *pacer);
+  pacer->frequency = 1000000000.0;
+  pacer->ticks_per_frame =
+      pacer->frequency / kHostPresentationFramesPerSecond;
+  pacer->next_deadline = FramePacerNow() + pacer->ticks_per_frame;
+  pacer->estimated_work_ticks = pacer->frequency / 500.0;
+  pacer->previous_present = FramePacerNow();
+  pacer->title_window_start = pacer->previous_present;
+  pacer->interval_min = DBL_MAX;
+#else
   mach_timebase_info_data_t timebase = {0, 0};
   mach_timebase_info(&timebase);
   if (!timebase.numer || !timebase.denom) {
@@ -326,6 +367,7 @@ static void FramePacerInit(Dkc1FramePacer *pacer) {
   pacer->previous_present = FramePacerNow();
   pacer->title_window_start = pacer->previous_present;
   pacer->interval_min = DBL_MAX;
+#endif
 }
 
 static void FramePacerReanchor(Dkc1FramePacer *pacer, double now) {
@@ -751,8 +793,13 @@ static void FramePacerPrintStats(const Dkc1FramePacer *pacer) {
 }
 
 static void ShowError(const char *title, const char *message) {
-  SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, title, message, s_window);
   fprintf(stderr, "%s: %s\n", title, message);
+#ifndef __SWITCH__
+  /* Switch SDL2 has no message-box backend; stderr (nxlink / debug.log
+   * file logging) carries the report instead. */
+  if (SDL_WasInit(SDL_INIT_VIDEO))
+    SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, title, message, s_window);
+#endif
 }
 
 static const char *LayerName(uint8_t mask) {
@@ -914,6 +961,21 @@ static void ApplyPresentationGeometry(void) {
 #ifdef _WIN32
   return; /* OpenGL fits the live drawable each frame, preserving SNES PAR. */
 #endif
+#ifdef __SWITCH__
+  /* Edge-to-edge handheld picture: no logical size, no integer scale,
+   * full viewport, linear sampling for the fractional stretch. Without
+   * this the integer scaler fits 399x224 into 1197x672 and centers it,
+   * leaving a small border on all sides. */
+  SDL_RenderSetLogicalSize(s_renderer, 0, 0);
+  SDL_RenderSetIntegerScale(s_renderer, SDL_FALSE);
+  SDL_RenderSetScale(s_renderer, 1.0f, 1.0f);
+  SDL_RenderSetViewport(s_renderer, NULL);
+  if (s_texture)
+    (void)SDL_SetTextureScaleMode(s_texture, SDL_ScaleModeLinear);
+  s_presentation_output_width = 0;
+  s_presentation_output_height = 0;
+  return;
+#endif
   s_presentation_output_width = 0;
   s_presentation_output_height = 0;
   if (s_metal_presenter_active) {
@@ -959,6 +1021,20 @@ static void ApplyWindowedSize(void) {
 static bool InitVideo(void) {
   const int window_width = PresentationWidth() * s_graphics.window_scale;
   const int window_height = kDkc1VideoHeight * s_graphics.window_scale;
+#ifdef __SWITCH__
+  /* Docked = 1080p, handheld = 720p: the only two modes Switch SDL2
+   * exposes (SDL_SetWindowSize switches between them). */
+  {
+    int switch_w = 1280, switch_h = 720;
+    if (appletGetOperationMode() == AppletOperationMode_Console) {
+      switch_w = 1920;
+      switch_h = 1080;
+    }
+    (void)window_width;
+    (void)window_height;
+    s_window = SDL_CreateWindow("DKC1Recomp", 0, 0, switch_w, switch_h, 0);
+  }
+#else
   s_window = SDL_CreateWindow(
       "DKC1Recomp", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
       window_width, window_height,
@@ -968,6 +1044,7 @@ static bool InitVideo(void) {
       | (EnvironmentEnabled("DKC1_SMOKE_TEST_HIDDEN") ? SDL_WINDOW_HIDDEN : 0)
 #endif
       );
+#endif
   if (!s_window)
     return false;
 #ifdef _WIN32
@@ -1025,8 +1102,10 @@ static bool InitVideo(void) {
 }
 
 static void InitDisplayLink(void) {
-#ifdef _WIN32
-  return; /* QPC owns emulation cadence; Windows uses the OpenGL presenter. */
+#if defined(_WIN32) || defined(__SWITCH__)
+  /* Windows owns cadence via QPC/OpenGL; Switch paces on the host clock
+   * with renderer vsync. Neither uses Metal/display-link. */
+  return;
 #else
   SDL_SysWMinfo window_info;
   SDL_VERSION(&window_info.version);
@@ -1155,6 +1234,10 @@ static void Present(void) {
 }
 
 static void OpenFirstController(void) {
+#ifdef __SWITCH__
+  /* Raw joystick path: no SDL_GameController mapping database needed. */
+  Dkc1SwitchRefreshPads();
+#else
   for (int i = 0; i < SDL_NumJoysticks(); i++) {
     if (!SDL_IsGameController(i)) continue;
     SDL_JoystickID id = SDL_JoystickGetDeviceInstanceID(i);
@@ -1168,6 +1251,7 @@ static void OpenFirstController(void) {
       break;
     }
   }
+#endif
 }
 
 static int SDLCALL HapticWorkerMain(void *unused) {
@@ -1276,6 +1360,12 @@ static void PulseStompHaptic(void) {
 }
 
 static void ControllerRemoved(SDL_JoystickID instance) {
+#ifdef __SWITCH__
+  /* Raw sticks are re-enumerated wholesale; detached handles drop
+   * inside the refresh. */
+  (void)instance;
+  Dkc1SwitchRefreshPads();
+#else
   for (int p = 0; p < 2; p++) {
     SDL_GameController *pad = s_controllers[p];
     if (!pad || SDL_JoystickInstanceID(SDL_GameControllerGetJoystick(pad)) != instance)
@@ -1285,6 +1375,7 @@ static void ControllerRemoved(SDL_JoystickID instance) {
     SDL_GameControllerClose(pad);
     s_controllers[p] = NULL;
   }
+#endif
 }
 
 static bool KeyPressed(int scancode, void *context) {
@@ -1306,8 +1397,14 @@ static int16_t UpPositiveAxis(SDL_GameController *pad, SDL_GameControllerAxis ax
 
 static uint32_t PollInput(void) {
   s_host_actions = 0;
+#ifdef __SWITCH__
+  /* The Switch window never loses input focus meaningfully; SDL may also
+   * report no focus flags in applet mode, which must not mute controls.
+   * There is no keyboard or GUI modifier key. */
+#else
   if (!(SDL_GetWindowFlags(s_window) & SDL_WINDOW_INPUT_FOCUS) ||
       (SDL_GetModState() & KMOD_GUI)) return 0;
+#endif
   const uint8_t *keys = SDL_GetKeyboardState(NULL);
   Dkc1GamepadState pads[2] = {0};
   const uint32_t button_masks[] = {
@@ -1319,6 +1416,11 @@ static uint32_t PollInput(void) {
     kDkc1GamepadDpadLeft, kDkc1GamepadDpadRight
   };
   size_t count = 0;
+#ifdef __SWITCH__
+  /* Player 1 autodetects the first attached pad; sticks + ZL/ZR triggers
+   * are decoded in switch_gamepad.c. */
+  count = Dkc1SwitchReadPads(pads, 2);
+#else
   for (int i = 0; i < 2; i++) if (s_controllers[i]) {
     SDL_GameController *pad = s_controllers[i];
     Dkc1GamepadState *state = &pads[count++];
@@ -1334,6 +1436,7 @@ static uint32_t PollInput(void) {
     state->right_trigger = (uint8_t)(SDL_GameControllerGetAxis(pad,
                                    SDL_CONTROLLER_AXIS_TRIGGERRIGHT) / 129);
   }
+#endif
   unsigned menu_buttons=0;
   for (size_t i=0;i<count;i++) menu_buttons|=pads[i].buttons;
   if ((menu_buttons&kDkc1GamepadGuide) ||
@@ -1776,6 +1879,10 @@ unsigned Dkc1MacPauseMenuController(void) {
 }
 
 static void OpenPauseMenu(int graphics_page) {
+#ifndef __SWITCH__
+  /* No pause menu on Switch: the stub always reports closed, so there is
+   * nothing to open. The pause chord in PollInput falls through to normal
+   * input. */
   if (Dkc1MacPauseMenuIsOpen()) return;
   SDL_SysWMinfo window; SDL_VERSION(&window.version);
   if (!SDL_GetWindowWMInfo(s_window,&window)) return;
@@ -1798,6 +1905,9 @@ static void OpenPauseMenu(int graphics_page) {
   s_reanchor_pacer=1;
   SDL_FlushEvent(SDL_KEYDOWN); SDL_FlushEvent(SDL_KEYUP);
   Dkc1MacMetalPresenterSetActive(1); Present(); UpdateTitle();
+#else
+  (void)graphics_page;
+#endif
 }
 
 static void HandleKey(SDL_Keycode key, SDL_Keymod mod) {
@@ -2007,6 +2117,12 @@ static void PollEvents(void) {
       case SDL_CONTROLLERDEVICEREMOVED:
         ControllerRemoved(event.cdevice.which);
         break;
+#ifdef __SWITCH__
+      case SDL_JOYDEVICEADDED:
+      case SDL_JOYDEVICEREMOVED:
+        OpenFirstController();
+        break;
+#endif
       case SDL_WINDOWEVENT:
         if (event.window.event == SDL_WINDOWEVENT_FOCUS_GAINED) {
           Dkc1MacMetalPresenterSetActive(1);
@@ -2071,8 +2187,14 @@ static void Cleanup(uint8_t *rom) {
 
 int main(int argc, char **argv) {
   SDL_SetMainReady();
+#ifdef __SWITCH__
+  /* Seamless handheld boot: SD app dir becomes cwd before anything else. */
+  SwitchImpl_Init();
+#endif
 #ifndef _WIN32
+#ifndef __SWITCH__
   (void)pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+#endif
 #else
   SDL_SetHint("SDL_WINDOWS_DPI_AWARENESS","permonitorv2");
 #endif
@@ -2081,7 +2203,15 @@ int main(int argc, char **argv) {
    * the Cocoa video backend initializes so FULLSCREEN_DESKTOP uses the full
    * borderless drawable instead. */
   SDL_SetHint(SDL_HINT_VIDEO_MAC_FULLSCREEN_SPACES, "0");
-  if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO | SDL_INIT_GAMECONTROLLER) != 0) {
+  if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO |
+#ifdef __SWITCH__
+               /* Raw SDL_Joystick path; the GameController mapping database
+                * is not needed (or trusted) in applet mode. */
+               SDL_INIT_JOYSTICK |
+#else
+               SDL_INIT_GAMECONTROLLER |
+#endif
+               SDL_INIT_TIMER) != 0) {
     fprintf(stderr, "SDL initialization failed: %s\n", SDL_GetError());
     return 3;
   }
@@ -2098,10 +2228,25 @@ int main(int argc, char **argv) {
 #endif
 
   char rom_path[PATH_MAX] = {0};
+#ifdef __SWITCH__
+  /* No launcher UI, no picker: straight from the SD app dir
+   * (sdmc:/switch/dkc1/rom.smc), romfs:/ as a dev fallback. */
+  {
+    const char *positional = argc > 1 ? argv[1] : NULL;
+    if (!SwitchImpl_ResolveRom(rom_path, sizeof rom_path, positional)) {
+      ShowError("DKC1Recomp",
+                "No ROM found. Copy rom.smc to sdmc:/switch/dkc1/.");
+      ThrowMissingROM();
+      SDL_Quit();
+      return 2;
+    }
+  }
+#else
   if (!ResolveRomPath(argc, argv, rom_path)) {
     SDL_Quit();
     return 0;
   }
+#endif
 
   size_t rom_size = 0;
   char rom_error[192];
@@ -2131,7 +2276,11 @@ int main(int argc, char **argv) {
     free(music_pack_path);
   }
 
+#ifndef __SWITCH__
+  /* Switch skips this: cwd is already sdmc:/switch/dkc1 (SwitchImpl_Init)
+   * and there is no per-OS app-data directory. */
   PrepareUserDirectory();
+#endif
   Dkc1MacLoadGraphics(&s_graphics);
   Dkc1DesktopColorFilterInit(&s_color_filter,s_graphics.screen);
   const char *aspect = getenv("DKC1_ASPECT");
@@ -2244,6 +2393,22 @@ int main(int argc, char **argv) {
   Dkc1MacInstallMenu();
   InitAudio();
   OpenFirstController();
+#ifdef __SWITCH__
+  /* Battery SRAM persistence (no desktop host persists SRAM; Switch
+   * does): load, seed-if-missing, then the 30 s loop writer below plus
+   * the framework exit/focus hooks cover the rest. */
+  RtlEnsureSaveDir();
+  RtlReadSram();
+  {
+    char sram_path[128];
+    RtlSramFilePath(sram_path, sizeof sram_path);
+    FILE *probe = fopen(sram_path, "rb");
+    if (probe)
+      fclose(probe);
+    else
+      RtlWriteSram();
+  }
+#endif
 
   char error[256];
   {
@@ -2305,6 +2470,11 @@ int main(int argc, char **argv) {
   PacingLogInit(&pacing_log);
 
   while (s_running) {
+#ifdef __SWITCH__
+    /* Home-button / suspend pump; libnx kills titles that starve
+     * appletMainLoop. An applet exit request also arrives as SDL_QUIT. */
+    if (!SwitchImpl_Tick()) break;
+#endif
     if (s_paused && !s_step_once) {
       PollEvents();
       if (!s_running)
@@ -2372,6 +2542,52 @@ int main(int argc, char **argv) {
     }
     phase_start = phase_end;
     uint32_t live_input = PollInput();
+#ifdef SWITCH_DEBUG
+    /* Debug-only (make DEBUG=1): L3 = quick-save, R3 = quick-load.
+     * Applied after the assist gate, which strips state actions while
+     * assist tools are off. Edge-triggered so a held click fires once. */
+    {
+      Dkc1GamepadState dbg_pad;
+      if (Dkc1SwitchReadPads(&dbg_pad, 1) > 0) {
+        static uint32_t s_prev_stick_click;
+        uint32_t cur = dbg_pad.buttons &
+            (kDkc1GamepadLeftStick | kDkc1GamepadRightStick);
+        uint32_t pressed = cur & ~s_prev_stick_click;
+        s_prev_stick_click = cur;
+        if (pressed & kDkc1GamepadLeftStick) {
+          s_host_actions |= kDkc1HostSaveState;
+          fprintf(stderr, "[SwitchDbg] quick-save\n");
+        }
+        if (pressed & kDkc1GamepadRightStick) {
+          s_host_actions |= kDkc1HostLoadState;
+          fprintf(stderr, "[SwitchDbg] quick-load\n");
+        }
+      }
+    }
+#endif
+#ifdef SWITCH_DEBUG
+    /* Debug-only (make DEBUG=1): L3 = quick-save, R3 = quick-load.
+     * Applied after the assist gate, which strips state actions while
+     * assist tools are off. Edge-triggered so a held click fires once. */
+    {
+      Dkc1GamepadState dbg_pad;
+      if (Dkc1SwitchReadPads(&dbg_pad, 1) > 0) {
+        static uint32_t s_prev_stick_click;
+        uint32_t cur = dbg_pad.buttons &
+            (kDkc1GamepadLeftStick | kDkc1GamepadRightStick);
+        uint32_t pressed = cur & ~s_prev_stick_click;
+        s_prev_stick_click = cur;
+        if (pressed & kDkc1GamepadLeftStick) {
+          s_host_actions |= kDkc1HostSaveState;
+          fprintf(stderr, "[SwitchDbg] quick-save\n");
+        }
+        if (pressed & kDkc1GamepadRightStick) {
+          s_host_actions |= kDkc1HostLoadState;
+          fprintf(stderr, "[SwitchDbg] quick-load\n");
+        }
+      }
+    }
+#endif
     if (s_assist_test_input.count)
       s_host_actions = Dkc1InputPlaybackFrame(&s_assist_test_input,
                                               (size_t)s_assist_test_tick);
@@ -2439,6 +2655,25 @@ int main(int argc, char **argv) {
     work_profile.ppu += phase_end - phase_start;
     phase_start = phase_end;
     s_host_frame++;
+#ifdef __SWITCH__
+    /* Persist SRAM every ~30 s so progress survives unclean exits; the
+     * framework exit/focus hooks cover clean quits. */
+    if (s_host_frame != 0 && (s_host_frame % 1800) == 0)
+      RtlWriteSram();
+    /* Dock/handheld transitions mid-session: resize to the matching
+     * mode (checked 12x/sec; SDL_SetWindowSize switches the output). */
+    if ((s_host_frame % 5) == 0) {
+      int want_w = 1280, want_h = 720;
+      int cur_w = 0, cur_h = 0;
+      if (appletGetOperationMode() == AppletOperationMode_Console) {
+        want_w = 1920;
+        want_h = 1080;
+      }
+      SDL_GetWindowSize(s_window, &cur_w, &cur_h);
+      if ((cur_w != want_w || cur_h != want_h) && s_window)
+        SDL_SetWindowSize(s_window, want_w, want_h);
+    }
+#endif
     Dkc1BlankScanFrame(s_host_frame, s_pixels, s_width,
                        kDkc1VideoHeight, Dkc1VideoTerrainReady());
     Dkc1InvariantMonitorFrame(s_host_frame);

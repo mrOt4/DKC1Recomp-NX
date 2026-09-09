@@ -1,0 +1,210 @@
+# Makefile.switch — Nintendo Switch (libnx) build for DKC1Recomp.
+#
+# No CMake, no launcher/menus: the NRO boots straight from
+# sdmc:/switch/dkc1/rom.smc. Requires devkitA64 + switch portlibs SDL2.
+#
+#   1. Generate private sources once (needs the USA v1.0 ROM):
+#        python scripts/generate_snesrecomp.py --rom <path>/dkc1.sfc
+#   2. make -f Makefile.switch            # -> dkc1.nro + dkc1.nacp
+#   3. Copy dkc1.nro to sdmc:/switch/dkc1/ and place rom.smc beside it.
+#
+# Video is SDL2 + OpenGL ES2 (SDL_RENDERER_ACCELERATED); audio is the SDL2
+# queue over audren; input is raw SDL_Joystick (see runner/switch_gamepad.c
+# for the Switch button map). Desktop-only units (Win32/macOS hosts,
+# Metal/GL presenters, native menus) are excluded here.
+
+.SUFFIXES:
+
+ifeq ($(strip $(DEVKITPRO)),)
+$(error "Please set DEVKITPRO in your environment. export DEVKITPRO=<path to>/devkitpro")
+endif
+
+TOPDIR ?= $(CURDIR)
+export TOPDIR
+include $(DEVKITPRO)/libnx/switch_rules
+
+TARGET		:=	dkc1
+BUILD		:=	build-switch
+APP_TITLE	:=	Donkey Kong Country
+APP_AUTHOR	:=	elliotttate and Souldbminer
+APP_VERSION	:=	0.1.0
+
+# SD layout: sdmc:/switch/<SWITCH_APP_DIR>/rom.smc (+config, saves).
+SWITCH_APP_DIR	?=	dkc1
+
+SNESRECOMP_ROOT	?=	$(TOPDIR)/snesrecomp
+export SNESRECOMP_ROOT
+include $(SNESRECOMP_ROOT)/runner/switch.mk
+
+# This pinned framework revision predates five newer runner units that
+# nothing in this game references; drop them instead of dirtying the
+# submodule. DKC1 supplies its own keybind/report adapters, so the
+# desktop mmx_config.c stays out as well.
+SNESRECOMP_SWITCH_CFILES := $(filter-out \
+	$(SNESRECOMP_SWITCH_ROOT)src/mod_audio.c \
+	$(SNESRECOMP_SWITCH_ROOT)src/host_mesh.c \
+	$(SNESRECOMP_SWITCH_ROOT)src/host_mesh_builder.c \
+	$(SNESRECOMP_SWITCH_ROOT)src/guarded_patch.c \
+	$(SNESRECOMP_SWITCH_ROOT)src/snes/sdd1.c \
+	$(SNESRECOMP_SWITCH_ROOT)src/desktop/mmx_config.c \
+	, $(SNESRECOMP_SWITCH_CFILES))
+
+# Private generated recomp units (scripts/generate_snesrecomp.py --rom ...).
+DKC1_GEN_DIR		:=	$(TOPDIR)/generated/snesrecomp
+DKC1_GEN_SOURCES	:=	$(wildcard $(DKC1_GEN_DIR)/*.c)
+
+GAME_CFILES := \
+	$(DKC1_GEN_SOURCES) \
+	$(TOPDIR)/runner/dkc1_game.c \
+	$(TOPDIR)/runner/dkc1_video.c \
+	$(TOPDIR)/runner/dkc1_baby_kong.c \
+	$(TOPDIR)/runner/dkc1_baby_kong_animation.c \
+	$(TOPDIR)/runner/dkc1_baby_kong_movement.c \
+	$(TOPDIR)/runner/dkc1_margin_proxy.c \
+	$(TOPDIR)/runner/dkc1_ws_trace.c \
+	$(TOPDIR)/runner/input_playback.c \
+	$(TOPDIR)/runner/wram_dump.c \
+	$(TOPDIR)/runner/dkc1_script.c \
+	$(TOPDIR)/runner/dkc1_debug_dump.c \
+	$(TOPDIR)/runner/dkc1_flight_recorder.c \
+	$(TOPDIR)/runner/dkc1_blank_scan.c \
+	$(TOPDIR)/runner/dkc1_invariant_monitor.c \
+	$(TOPDIR)/runner/verified_rom.c \
+	$(TOPDIR)/runner/headless_host.c \
+	$(TOPDIR)/runner/sdl_host.c \
+	$(TOPDIR)/runner/dkc1_haptics.c \
+	$(TOPDIR)/runner/switch_msu1_stub.c \
+	$(TOPDIR)/runner/desktop_audio_rate.c \
+	$(TOPDIR)/runner/desktop_rewind.c \
+	$(TOPDIR)/runner/desktop_input.c \
+	$(TOPDIR)/runner/desktop_refresh.c \
+	$(TOPDIR)/runner/desktop_crt.c \
+	$(TOPDIR)/runner/desktop_filter.c \
+	$(TOPDIR)/runner/desktop_graphics.c \
+	$(TOPDIR)/runner/switch_platform.c \
+	$(TOPDIR)/runner/switch_gamepad.c
+
+# Early dirs win bare-header resolution (notably runner/ headers over any
+# same-named framework ones). The framework dirs must precede any
+# third-party dir that ships colliding bare headers.
+GAME_INCLUDES_EARLY := \
+	$(TOPDIR)/runner \
+	$(TOPDIR)/recomp
+
+GAME_INCLUDES_LATE :=
+
+GAME_DEFS := \
+	-DDKC1_RELEASE_VERSION='"0.1.0-switch"' \
+	-DSNESRECOMP_REVERSE_DEBUG=0 \
+	-DSNESRECOMP_EXTERNAL_RAM_ROUTINE_GUARDS=1 \
+	-DSYSTEM_VOLUME_MIXER_AVAILABLE=0 \
+	-DSDL_MAIN_HANDLED \
+	-DDKC1_REAL_HOST_REPORT=1 \
+	-DSWITCH_APP_DIR='"$(SWITCH_APP_DIR)"'
+
+# Debug-only Switch extras: make -f Makefile.switch DEBUG=1
+# (L3 = quick-save, R3 = quick-load). Off by default.
+ifdef DEBUG
+GAME_DEFS += -DSWITCH_DEBUG
+endif
+
+DATA		:=
+ROMFS		:=
+APP_ICON	:=	$(TOPDIR)/assets/switch/icon.jpg
+
+ARCH	:=	-march=armv8-a+crc+crypto -mtune=cortex-a57 -mtp=soft -fPIE
+
+CFILES		:=	$(GAME_CFILES) $(SNESRECOMP_SWITCH_CFILES)
+
+_BASENAMES	:=	$(notdir $(CFILES))
+ifneq ($(words $(_BASENAMES)),$(words $(sort $(_BASENAMES))))
+$(error "duplicate .c basenames across game + runner sources")
+endif
+
+INCLUDE		:=	$(foreach dir,$(GAME_INCLUDES_EARLY),-I$(dir)) \
+			$(foreach dir,$(SNESRECOMP_SWITCH_INCLUDES),-I$(dir)) \
+			$(foreach dir,$(GAME_INCLUDES_LATE),-I$(dir)) \
+			-I$(TOPDIR)/$(BUILD)
+
+DEFINES		:=	$(SNESRECOMP_SWITCH_DEFS) $(GAME_DEFS)
+
+CFLAGS		:=	-g -Wall -O2 -ffunction-sections \
+			$(ARCH) $(DEFINES) $(INCLUDE) `sdl2-config --cflags`
+
+CXXFLAGS	:=	$(CFLAGS) -fno-rtti -fno-exceptions
+
+ASFLAGS		:=	-g $(ARCH)
+LDFLAGS		=	-specs=$(DEVKITPRO)/libnx/switch.specs -g $(ARCH) \
+			-Wl,-Map,$(notdir $*.map)
+
+# GC sections so never-called desktop-only entry points are dropped.
+LDFLAGS		+=	-Wl,--gc-sections
+
+LIBS		:=	`sdl2-config --libs` -lm
+
+LIBDIRS		:=	$(PORTLIBS) $(LIBNX)
+
+ifneq ($(BUILD),$(notdir $(CURDIR)))
+
+export OUTPUT	:=	$(TOPDIR)/$(TARGET)
+
+export VPATH	:=	$(sort $(dir $(CFILES)))
+
+export DEPSDIR	:=	$(TOPDIR)/$(BUILD)
+
+export OFILES_SRC	:=	$(notdir $(CFILES:.c=.o))
+export OFILES		:=	$(OFILES_SRC)
+export HFILES_BIN	:=
+
+# Link with CC (no C++ in the Switch build).
+export LD	:=	$(CC)
+
+export INCLUDE	:=	$(INCLUDE)
+export LIBPATHS	:=	$(foreach dir,$(LIBDIRS),-L$(dir)/lib)
+
+ifeq ($(wildcard $(APP_ICON)),)
+export NROFLAGS += --icon=$(DEVKITPRO)/libnx/default_icon.jpg
+else
+export NROFLAGS += --icon=$(APP_ICON)
+endif
+export NROFLAGS += --nacp=$(TOPDIR)/$(TARGET).nacp
+
+ifneq ($(ROMFS),)
+export NROFLAGS += --romfsdir=$(TOPDIR)/$(ROMFS)
+endif
+
+.PHONY: $(BUILD) clean all
+
+all: $(BUILD)
+
+$(BUILD):
+	@[ -d $@ ] || mkdir -p $@
+	@$(MAKE) --no-print-directory -C $(BUILD) -f $(TOPDIR)/Makefile.switch
+
+clean:
+	@echo clean ...
+	@rm -fr $(BUILD) $(TARGET).nro $(TARGET).nacp $(TARGET).elf
+
+else
+
+.PHONY:	all
+
+DEPENDS	:=	$(OFILES:.o=.d)
+
+all	:	$(OUTPUT).nro
+
+$(OUTPUT).nro	:	$(OUTPUT).elf $(OUTPUT).nacp
+
+# Explicit link through a response file: generated recomp trees put
+# hundreds of objects on the link line, past Windows' CreateProcess
+# limit ("Argument list too long").
+$(OUTPUT).elf	:	$(OFILES)
+	@echo linking $(notdir $@)
+	@rm -f $(DEPSDIR)/objects.rsp
+	@$(foreach o,$(OFILES),echo $(o) >> $(DEPSDIR)/objects.rsp;)
+	@$(LD) $(LDFLAGS) @$(DEPSDIR)/objects.rsp $(LIBPATHS) $(LIBS) -o $@
+	@$(NM) -CSn $@ > $(OUTPUT).lst
+
+-include $(DEPENDS)
+
+endif

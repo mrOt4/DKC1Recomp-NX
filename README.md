@@ -1,3 +1,8 @@
+# AI Usage Disclosure from Soul
+Yes, I used AI.
+No, I don't care about your opinion
+This was to simply port a game I love to Switch without spending a week.
+
 # DKC1Recomp
 
 Static recompilation of *Donkey Kong Country* (SNES, USA v1.0) into a native

@@ -30,6 +30,10 @@ void NORETURN Die(const char *error) {
 void RtlApuLock(void) {}
 void RtlApuUnlock(void) {}
 
+#ifndef DKC1_REAL_HOST_REPORT
+/* Playable hosts that link the real host_report.c define
+ * DKC1_REAL_HOST_REPORT=1 to take the real breadcrumbs/diagnostics
+ * instead of these headless stubs (same pattern as DKC2). */
 void host_report_init(const char *game_name, const char *build_version) {
   (void)game_name;
   (void)build_version;
@@ -58,3 +62,5 @@ const char *host_report_preserve_crash_copy(const char *path) {
   return NULL;
 }
 void host_report_crash_test_tick(void) {}
+
+#endif /* !DKC1_REAL_HOST_REPORT */
