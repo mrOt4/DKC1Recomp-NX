@@ -69,7 +69,10 @@ class Record:
 
 
 def read_dump(path: Path) -> list[Record]:
-    data = path.read_bytes()
+    return parse_records(path.read_bytes(), str(path))
+
+
+def parse_records(data: bytes, path: str = "dump") -> list[Record]:
     if data[:8] != DUMP_MAGIC:
         raise SystemExit(f"{path}: not a DKC1 HD dump")
     version, count = struct.unpack_from("<II", data, 8)
@@ -118,23 +121,38 @@ def fill_transparent(rgba: np.ndarray) -> np.ndarray:
 
 def merge_dumps(directories: list[Path]) -> list[Record]:
     """Best-scoring occurrence of every character across several dumps
-    (e.g. one per level); sightings are summed."""
-    best: dict[int, Record] = {}
+    (e.g. one per level); sightings are summed. Records are compared on
+    their fixed header first and only the winners are decoded."""
+    size = RECORD.size + CROP_BYTES
+    best: dict[int, tuple[tuple, bytes]] = {}
+    seen: dict[int, int] = {}
     for directory in directories:
         path = directory / "dump.bin"
         if not path.exists():
             continue
-        for record in read_dump(path):
-            kept = best.get(record.key)
-            if kept is None:
-                best[record.key] = record
+        data = path.read_bytes()
+        if data[:8] != DUMP_MAGIC:
+            raise SystemExit(f"{path}: not a DKC1 HD dump")
+        version, count = struct.unpack_from("<II", data, 8)
+        if version != 3:
+            raise SystemExit(f"{path}: unsupported dump version {version}")
+        for i in range(count):
+            offset = 16 + i * size
+            key, _, _, _, has_crop, score, sightings = struct.unpack_from(
+                "<Q4BfI", data, offset)
+            seen[key] = seen.get(key, 0) + sightings
+            if not has_crop:
                 continue
-            seen = kept.count + record.count
-            if (record.score, record.layer_context) > (kept.score,
-                                                       kept.layer_context):
-                best[record.key] = record
-            best[record.key].count = seen
-    return list(best.values())
+            rank = (score, has_crop == 1)
+            kept = best.get(key)
+            if kept is None or rank > kept[0]:
+                best[key] = (rank, data[offset:offset + size])
+    blob = b"".join(raw for _, raw in best.values())
+    header = DUMP_MAGIC + struct.pack("<II", 3, len(best))
+    records = parse_records(header + blob)
+    for record in records:
+        record.count = seen[record.key]
+    return records
 
 
 def decode_char(raw: np.ndarray, depth: int) -> np.ndarray:
