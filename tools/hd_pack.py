@@ -116,6 +116,27 @@ def fill_transparent(rgba: np.ndarray) -> np.ndarray:
     return np.clip(rgb + 0.5, 0, 255).astype(np.uint8)
 
 
+def merge_dumps(directories: list[Path]) -> list[Record]:
+    """Best-scoring occurrence of every character across several dumps
+    (e.g. one per level); sightings are summed."""
+    best: dict[int, Record] = {}
+    for directory in directories:
+        path = directory / "dump.bin"
+        if not path.exists():
+            continue
+        for record in read_dump(path):
+            kept = best.get(record.key)
+            if kept is None:
+                best[record.key] = record
+                continue
+            seen = kept.count + record.count
+            if (record.score, record.layer_context) > (kept.score,
+                                                       kept.layer_context):
+                best[record.key] = record
+            best[record.key].count = seen
+    return list(best.values())
+
+
 def decode_char(raw: np.ndarray, depth: int) -> np.ndarray:
     """8x8 palette-relative indices of a planar SNES character."""
     out = np.zeros((8, 8), np.uint8)
@@ -297,8 +318,10 @@ def write_pack(out: Path, tiles: dict[int, np.ndarray], scale: int,
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    parser.add_argument("--dump", type=Path, required=True,
-                        help="directory holding dump.bin (DKC1_HD_DUMP)")
+    parser.add_argument("--dump", type=Path, required=True, nargs="+",
+                        help="one or more directories holding dump.bin "
+                             "(DKC1_HD_DUMP); the best occurrence of each "
+                             "character across all of them is used")
     parser.add_argument("--rom", type=Path, required=True,
                         help="the same DKC1 USA v1.0 ROM (digest is checked)")
     parser.add_argument("--out", type=Path, required=True,
@@ -330,7 +353,7 @@ def main() -> int:
     args = parser.parse_args()
 
     digest = verify_rom(args.rom)
-    records = read_dump(args.dump / "dump.bin")
+    records = merge_dumps(args.dump)
     if args.identity:
         # Regression pack: every HD texel is its native texel. The runtime
         # must then reproduce the native frame exactly (tools/hd_seams.py
@@ -344,7 +367,8 @@ def main() -> int:
         return 0
     if args.limit:
         records = sorted(records, key=lambda r: -r.count)[:args.limit]
-    print(f"{len(records)} characters with context in {args.dump}")
+    print(f"{len(records)} characters with context from "
+          f"{len(args.dump)} dump(s)")
     work = Path(tempfile.mkdtemp(prefix="dkc1-hd-"))
     try:
         keys = np.array([r.key for r in records], np.uint64)

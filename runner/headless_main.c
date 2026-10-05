@@ -372,6 +372,11 @@ int main(int argc, char **argv) {
         free(rom);
         return 21;
       }
+      if (script_ops.poke) {
+        g_ram[script_ops.poke_address] = (uint8_t)script_ops.poke_value;
+        g_ram[script_ops.poke_address + 1] =
+            (uint8_t)(script_ops.poke_value >> 8);
+      }
       if (script_ops.state_load && !RtlLoadSnapshot(script_ops.state_load)) {
         fprintf(stderr, "script: unable to load snapshot %s\n",
                 script_ops.state_load);

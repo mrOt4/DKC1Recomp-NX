@@ -29,6 +29,12 @@ typedef struct Dkc1ScriptOps {
   const char *state_save;   /* non-NULL: save at the current boundary */
   const char *state_load;   /* non-NULL: load at the current boundary */
   bool run_frame;           /* true when the returned input must be run */
+  /* poke ADDR VALUE: 16-bit WRAM write at the current boundary. A QA and
+   * asset-dump tool (e.g. level warps for DKC1_HD_DUMP); the headless host
+   * applies it, interactive hosts ignore it. */
+  bool poke;
+  uint32_t poke_address;
+  uint16_t poke_value;
 } Dkc1ScriptOps;
 
 bool Dkc1ScriptLoad(const char *path, char *error, size_t error_size);

@@ -18,6 +18,7 @@ enum Dkc1ScriptOpKind {
   kOpCheckpoint,
   kOpStateSave,
   kOpStateLoad,
+  kOpPoke,       /* 16-bit WRAM write, zero frames */
 };
 
 enum { kDkc1ScriptMaxSteps = 4096, kDkc1ScriptDefaultTimeout = 3600 };
@@ -85,6 +86,7 @@ void Dkc1ScriptStatus(char *buffer, size_t buffer_size) {
     case kOpCheckpoint: kind = "checkpoint"; break;
     case kOpStateSave: kind = "state save"; break;
     case kOpStateLoad: kind = "state load"; break;
+    case kOpPoke: kind = "poke"; break;
   }
   if (step->kind == kOpWait || step->kind == kOpPulse) {
     snprintf(buffer, buffer_size,
@@ -287,6 +289,20 @@ bool Dkc1ScriptLoad(const char *path, char *error, size_t error_size) {
         ok = ParsePredicate(tokens + 2, token_count - 2, &step, line) &&
              AppendStep(&step, line);
       }
+    } else if (strcmp(tokens[0], "poke") == 0) {
+      unsigned long address, value;
+      if (token_count != 3 || !ParseUnsigned(tokens[1], &address, 16) ||
+          address > 0x1fffe || !ParseUnsigned(tokens[2], &value, 16) ||
+          value > 0xffff) {
+        SetError("poke needs a WRAM ADDR (hex, < 1FFFF) and a 16-bit VALUE",
+                 line);
+        ok = false;
+      } else {
+        step.kind = kOpPoke;
+        step.address = (uint32_t)address;
+        step.value = (uint32_t)value;
+        ok = AppendStep(&step, line);
+      }
     } else if (strcmp(tokens[0], "checkpoint") == 0 ||
                strcmp(tokens[0], "state_save") == 0 ||
                strcmp(tokens[0], "state_load") == 0) {
@@ -396,6 +412,14 @@ uint32_t Dkc1ScriptNextInput(const uint8_t *wram, Dkc1ScriptOps *ops,
       return 0;
     } else if (step->kind == kOpStateSave) {
       if (ops) ops->state_save = step->text;
+      s_cursor++;
+      return 0;
+    } else if (step->kind == kOpPoke) {
+      if (ops) {
+        ops->poke = true;
+        ops->poke_address = step->address;
+        ops->poke_value = (uint16_t)step->value;
+      }
       s_cursor++;
       return 0;
     } else if (step->kind == kOpStateLoad) {

@@ -1065,13 +1065,21 @@ static void ResolvePackSlots(Ppu *ppu, int width) {
  * overrides the count (1 = single-threaded). */
 enum { kHdMaxWorkers = 8 };
 
+/* MSVC uses native threads. MinGW-w64 uses winpthreads instead: its
+ * <windows.h> inline helpers clash between translation units in C11. */
+#if defined(_WIN32) && !defined(__MINGW32__)
+#define HD_WIN32_THREADS 1
+#else
+#define HD_WIN32_THREADS 0
+#endif
+
 typedef struct HdBand {
   Ppu *ppu;
   int width, y0, y1;
   Dkc1HdStats stats;
 } HdBand;
 
-#if defined(_WIN32)
+#if HD_WIN32_THREADS
 #include <windows.h>
 typedef HANDLE HdThread;
 static CRITICAL_SECTION s_pool_lock;
@@ -1103,7 +1111,7 @@ static void RunBand(HdBand *band) {
   ComposeRows(band->ppu, band->width, band->y0, band->y1, &band->stats);
 }
 
-#if defined(_WIN32)
+#if HD_WIN32_THREADS
 static DWORD WINAPI WorkerMain(LPVOID arg)
 #else
 static void *WorkerMain(void *arg)
@@ -1123,7 +1131,7 @@ static void *WorkerMain(void *arg)
       POOL_BROADCAST(s_pool_done);
     POOL_UNLOCK();
   }
-#if defined(_WIN32)
+#if HD_WIN32_THREADS
   return 0;
 #else
   return NULL;
@@ -1131,10 +1139,13 @@ static void *WorkerMain(void *arg)
 }
 
 static int CpuCount(void) {
-#if defined(_WIN32)
+#if HD_WIN32_THREADS
   SYSTEM_INFO info;
   GetSystemInfo(&info);
   return (int)info.dwNumberOfProcessors;
+#elif defined(__MINGW32__)
+  const int n = pthread_num_processors_np();
+  return n > 0 ? n : 1;
 #elif defined(__SWITCH__)
   return 3;  /* one core stays with the emulation thread */
 #else
@@ -1150,14 +1161,14 @@ static void StartWorkers(void) {
   if (threads < 1) threads = 1;
   if (threads > kHdMaxWorkers + 1) threads = kHdMaxWorkers + 1;
   s_workers = 0;
-#if defined(_WIN32)
+#if HD_WIN32_THREADS
   InitializeCriticalSection(&s_pool_lock);
   InitializeConditionVariable(&s_pool_wake);
   InitializeConditionVariable(&s_pool_done);
 #endif
   for (int i = 1; i < threads; i++) {
     HdThread thread;
-#if defined(_WIN32)
+#if HD_WIN32_THREADS
     thread = CreateThread(NULL, 0, WorkerMain, (LPVOID)(intptr_t)i, 0, NULL);
     if (!thread) break;
     CloseHandle(thread);
@@ -1172,7 +1183,7 @@ static void StartWorkers(void) {
 
 /* Monotonic clock for the compositor timing statistic. */
 static uint64_t NowNs(void) {
-#if defined(_WIN32)
+#if HD_WIN32_THREADS
   LARGE_INTEGER counter, frequency;
   QueryPerformanceCounter(&counter);
   QueryPerformanceFrequency(&frequency);

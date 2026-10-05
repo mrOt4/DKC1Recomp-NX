@@ -1,0 +1,14 @@
+# HD tile dump for one entrance: same deterministic start as route_jungle.dks,
+# then a QA warp on the map (poke $003E = @ENTRANCE@, the entrance/level ID)
+# and the run/roll/jump cycle of hd_dump_jungle.dks. Expanded per entrance by
+# tools/hd_dump_all.sh; for asset dumps only (DKC1_HD_DUMP, headless).
+wait 0032 == 0001 timeout 600
+0 * 5100
+pulse 8 6 120 003e == 00eb timeout 6000
+pulse 8 6 120 003e == 00ec timeout 2000
+pulse 8 6 120 003e == 0016 timeout 2000
+0 * 1500
+poke 003e @ENTRANCE@
+pulse 8 8 150 0028 <= 0008 timeout 4000
+@CYCLE@
+0 * 60

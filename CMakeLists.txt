@@ -208,7 +208,13 @@ if(WIN32)
     target_link_libraries(dkc1_windows PRIVATE ${SNESRECOMP_RUNNER_LIBRARIES}
         SDL2::SDL2 miniz opengl32 dwmapi comctl32 comdlg32 shell32 ole32 uuid gdi32)
     set_target_properties(dkc1_windows PROPERTIES OUTPUT_NAME DKC1Recomp WIN32_EXECUTABLE TRUE)
-    target_link_options(dkc1_windows PRIVATE /ENTRY:mainCRTStartup)
+    if(MSVC)
+        target_link_options(dkc1_windows PRIVATE /ENTRY:mainCRTStartup)
+    else()
+        # MinGW-w64 (cross builds): its CRT calls main() for GUI programs too;
+        # link the GCC and pthread runtimes statically so only SDL2.dll ships.
+        target_link_options(dkc1_windows PRIVATE -static)
+    endif()
     add_custom_command(TARGET dkc1_windows POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:SDL2::SDL2>
             $<TARGET_FILE_DIR:dkc1_windows>)
@@ -223,6 +229,8 @@ if(WIN32)
     file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/music-test)
     add_test(NAME windows_music COMMAND test_windows_music ${CMAKE_CURRENT_BINARY_DIR}/music-test)
     add_test(NAME windows_platform COMMAND dkc1_windows --platform-test ${CMAKE_CURRENT_BINARY_DIR}/music-test)
-    set_source_files_properties(runner/windows_platform.c runner/windows_graphics.c
-        runner/windows_music_pack.c PROPERTIES COMPILE_OPTIONS "/W4;/WX")
+    if(MSVC)
+        set_source_files_properties(runner/windows_platform.c runner/windows_graphics.c
+            runner/windows_music_pack.c PROPERTIES COMPILE_OPTIONS "/W4;/WX")
+    endif()
 endif()

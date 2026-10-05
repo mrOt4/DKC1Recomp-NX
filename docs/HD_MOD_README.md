@@ -43,6 +43,19 @@ python tools/hd_pack.py --dump ~/dkc1-hd/dump \
   --upscaler /ruta/realesrgan-ncnn-vulkan --out ~/dkc1-hd/DKC1-HD-Remaster
 ```
 
+Para todo el juego, `tools/hd_dump_all.sh` repite el volcado para cada
+identificador de entrada (`$003E`, 256 destinos: niveles, salas de bonus,
+jefes, mapas y cabañas). Entra en cada uno con un salto de nivel de QA
+(`poke` en `recipes/hd_dump_warp.dks.in`) y luego se pasan todos los
+volcados juntos a `hd_pack.py`:
+
+```sh
+tools/hd_dump_all.sh build/dkc1_snesrecomp_headless \
+  "/ruta/Donkey Kong Country (USA).sfc" ~/dkc1-hd/dumps
+python tools/hd_pack.py --dump ~/dkc1-hd/dumps/* --rom "/ruta/...sfc" \
+  --upscaler /ruta/realesrgan-ncnn-vulkan --out ~/dkc1-hd/DKC1-HD-Remaster
+```
+
 Valores por defecto de la receta "DKC1 HD Remaster": modelo
 `realesr-animevideov3`, escala 4, `--detail 0.35`, `--dither 0.7`.
 
