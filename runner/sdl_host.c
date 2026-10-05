@@ -2147,7 +2147,33 @@ static void PollEvents(void) {
   }
 }
 
+#ifdef __SWITCH__
+/* Copy of the SRAM image last written to the SD card. NULL until the
+ * save has been loaded, so no flush can clobber it with an unread
+ * (zeroed) image on an early-exit path. */
+static uint8_t *s_sram_persisted;
+
+static void SwitchSramSnapshot(void) {
+  if (!g_sram || g_sram_size <= 0) return;
+  if (!s_sram_persisted) s_sram_persisted = malloc((size_t)g_sram_size);
+  if (s_sram_persisted)
+    memcpy(s_sram_persisted, g_sram, (size_t)g_sram_size);
+}
+
+/* Write SRAM only when the game has changed it since the last write:
+ * spares the SD card and avoids a periodic main-thread stall. */
+static void SwitchSramFlushIfDirty(void) {
+  if (!s_sram_persisted || !g_sram || g_sram_size <= 0) return;
+  if (memcmp(s_sram_persisted, g_sram, (size_t)g_sram_size) == 0) return;
+  RtlWriteSram();
+  SwitchSramSnapshot();
+}
+#endif
+
 static void Cleanup(uint8_t *rom) {
+#ifdef __SWITCH__
+  SwitchSramFlushIfDirty();
+#endif
 #ifdef _WIN32
   Dkc1WindowsDetach();
   Dkc1WindowsGraphicsClose();
@@ -2395,7 +2421,7 @@ int main(int argc, char **argv) {
   OpenFirstController();
 #ifdef __SWITCH__
   /* Battery SRAM persistence (no desktop host persists SRAM; Switch
-   * does): load, seed-if-missing, then the 30 s loop writer below plus
+   * does): load, seed-if-missing, then the 5 s dirty-check writer below plus
    * the framework exit/focus hooks cover the rest. */
   RtlEnsureSaveDir();
   RtlReadSram();
@@ -2408,6 +2434,7 @@ int main(int argc, char **argv) {
     else
       RtlWriteSram();
   }
+  SwitchSramSnapshot();
 #endif
 
   char error[256];
@@ -2656,10 +2683,11 @@ int main(int argc, char **argv) {
     phase_start = phase_end;
     s_host_frame++;
 #ifdef __SWITCH__
-    /* Persist SRAM every ~30 s so progress survives unclean exits; the
-     * framework exit/focus hooks cover clean quits. */
-    if (s_host_frame != 0 && (s_host_frame % 1800) == 0)
-      RtlWriteSram();
+    /* Check SRAM every ~5 s and persist it only if it changed, so
+     * progress survives unclean exits without rewriting the SD card on
+     * every tick; the framework exit/focus hooks cover clean quits. */
+    if (s_host_frame != 0 && (s_host_frame % 300) == 0)
+      SwitchSramFlushIfDirty();
     /* Dock/handheld transitions mid-session: resize to the matching
      * mode (checked 12x/sec; SDL_SetWindowSize switches the output). */
     if ((s_host_frame % 5) == 0) {

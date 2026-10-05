@@ -140,6 +140,9 @@ LDFLAGS		=	-specs=$(DEVKITPRO)/libnx/switch.specs -g $(ARCH) \
 # GC sections so never-called desktop-only entry points are dropped.
 LDFLAGS		+=	-Wl,--gc-sections
 
+# Neutralize SDL2's Switch keyboard pump (framework switch_impl.c).
+LDFLAGS		+=	$(SNESRECOMP_SWITCH_WRAP)
+
 LIBS		:=	`sdl2-config --libs` -lm
 
 LIBDIRS		:=	$(PORTLIBS) $(LIBNX)

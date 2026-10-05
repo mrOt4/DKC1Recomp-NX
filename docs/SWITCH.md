@@ -66,7 +66,7 @@ stay.
 | Path | Role |
 |---|---|
 | `Makefile.switch` | devkitA64 makefile (includes the framework fragment, forces SDL2/no-launcher defines, `--gc-sections`) |
-| `runner/sdl_host.c` (`__SWITCH__`) | SD bring-up, `sdmc:/switch/dkc1/rom.smc` resolution, fixed 720p window, SDL-clock frame pacer, raw-joystick input, applet tick, SRAM seed + 30 s writer, L3/R3 debug |
+| `runner/sdl_host.c` (`__SWITCH__`) | SD bring-up, `sdmc:/switch/dkc1/rom.smc` resolution, fixed 720p window, SDL-clock frame pacer, raw-joystick input, applet tick, SRAM seed + 5 s dirty-check writer, L3/R3 debug |
 | `runner/switch_platform.c` | `Dkc1Mac*` surface: fixed handheld settings/controls, null pickers, no-op menus/links/presenters |
 | `runner/switch_gamepad.c` | HID-order raw joystick reader (A/B/X/Y, ZL/ZR triggers, +/-/Start/Select, stick-as-DPad) + native 2-pad controller applet |
 | `runner/switch_msu1_stub.c` | no-op MSU-1 (needs mmap + pack UX) |
