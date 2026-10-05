@@ -117,6 +117,10 @@ if(MSVC)
 endif()
 target_link_libraries(dkc1_snesrecomp_headless PRIVATE
     ${SNESRECOMP_RUNNER_LIBRARIES})
+if(MINGW)
+    # Self-contained cross build: no libgcc/winpthread DLLs to ship.
+    target_link_options(dkc1_snesrecomp_headless PRIVATE -static)
+endif()
 
 if(APPLE)
     enable_language(OBJC)
