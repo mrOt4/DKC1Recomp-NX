@@ -7,7 +7,8 @@
 typedef struct Dkc1Msu1 Dkc1Msu1;
 
 /* Opens an extracted MSU-1 music directory containing track-N.pcm or
- * dkc_msu-N.pcm files. The returned object is host-only and never enters a
+ * dkc_msu-N.pcm files, or their compressed track-N.ogg / dkc_msu-N.ogg
+ * versions (tools/msu1_compress.py; loop frame in the MSU1_LOOP comment). The returned object is host-only and never enters a
  * cartridge save state. */
 Dkc1Msu1 *Dkc1Msu1Open(const char *directory, char *error,
                         size_t error_size);

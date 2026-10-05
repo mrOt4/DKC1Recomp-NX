@@ -14,8 +14,10 @@
 
 enum {
   kDkc1MetalFrameSlots = 3,
-  kDkc1MetalFrameBytes =
-      kDkc1VideoWidescreenWidth * kDkc1VideoHeight * 4,
+  /* Room for the HD texture surface: up to 4x the widest presentation. */
+  kDkc1MetalMaxScale = 4,
+  kDkc1MetalFrameBytes = kDkc1VideoWidescreenWidth * kDkc1MetalMaxScale *
+                         kDkc1VideoHeight * kDkc1MetalMaxScale * 4,
 };
 
 typedef struct Dkc1MetalFrame {
@@ -23,6 +25,8 @@ typedef struct Dkc1MetalFrame {
   int width;
   int height;
   int presentationWidth;
+  int logicalHeight;  /* height of the picture the pixels represent */
+  BOOL hd;            /* HD texture surface: bypass Reconstruct/CRT */
   uint64_t sequence;
   Dkc1MacPresentationFrameInfo info;
 } Dkc1MetalFrame;
@@ -232,6 +236,8 @@ static Dkc1MetalPresenter *s_metal_presenter;
     Dkc1MetalFrame *presentFrame = &currentFrame;
     const int sourceWidth = presentFrame->width;
     const int sourceHeight = presentFrame->height;
+    const int logicalHeight = presentFrame->logicalHeight;
+    const BOOL hdFrame = presentFrame->hd;
     const int framePresentationWidth = presentFrame->presentationWidth;
     const Dkc1MetalTraceFrame traceFrame = {
       .sequence = presentFrame->sequence,
@@ -244,26 +250,32 @@ static Dkc1MetalPresenter *s_metal_presenter;
     const NSUInteger outputHeight = drawable.texture.height;
     int fittedWidth = (int)outputWidth;
     int fittedHeight = (int)outputHeight;
-    if ((uint64_t)outputWidth * (uint64_t)sourceHeight <=
+    if ((uint64_t)outputWidth * (uint64_t)logicalHeight <=
         (uint64_t)outputHeight *
             (uint64_t)framePresentationWidth) {
-      fittedHeight = (int)(((uint64_t)outputWidth * sourceHeight +
+      fittedHeight = (int)(((uint64_t)outputWidth * logicalHeight +
                             framePresentationWidth / 2) /
                            framePresentationWidth);
     } else {
       fittedWidth = (int)(((uint64_t)outputHeight *
                            framePresentationWidth +
-                           sourceHeight / 2) /
-                          sourceHeight);
+                           logicalHeight / 2) /
+                          logicalHeight);
     }
     const int fittedX = ((int)outputWidth - fittedWidth) / 2;
     const int fittedY = ((int)outputHeight - fittedHeight) / 2;
 
     id<MTLCommandBuffer> commandBuffer = [commandQueue commandBuffer];
-    if (![graphics encodePixels:(const uint32_t *)presentFrame->pixels
+    const MTLViewport fitted =
+        (MTLViewport){fittedX,fittedY,fittedWidth,fittedHeight,0,1};
+    if (hdFrame) {
+      if (![graphics encodeHdPixels:(const uint32_t *)presentFrame->pixels
+          width:sourceWidth height:sourceHeight target:drawable.texture
+          viewport:fitted commandBuffer:commandBuffer]) return;
+    } else if (![graphics encodePixels:(const uint32_t *)presentFrame->pixels
         width:sourceWidth height:sourceHeight target:drawable.texture
-        viewport:(MTLViewport){fittedX,fittedY,fittedWidth,fittedHeight,0,1}
-        settings:presentSettings commandBuffer:commandBuffer]) return;
+        viewport:fitted settings:presentSettings
+        commandBuffer:commandBuffer]) return;
 
     [commandBuffer addCompletedHandler:^(id<MTLCommandBuffer> completed) {
       if (completed.status == MTLCommandBufferStatusError) {
@@ -475,12 +487,14 @@ int Dkc1MacMetalPresenterStart(void *native_window, double preferred_hz,
   }
 }
 
-void Dkc1MacMetalPresenterQueueFrame(
-    const uint32_t *pixels, int width, int height, int framePresentationWidth,
-    const Dkc1MacPresentationFrameInfo *info) {
+static void QueueFrame(const uint32_t *pixels, int width, int height,
+                       int framePresentationWidth, int logicalHeight, BOOL hd,
+                       const Dkc1MacPresentationFrameInfo *info) {
   Dkc1MetalPresenter *presenter = s_metal_presenter;
+  const int maxScale = hd ? kDkc1MetalMaxScale : 1;
   if (!presenter || !pixels || !info || width <= 0 || height <= 0 ||
-      width > kDkc1VideoWidescreenWidth || height > kDkc1VideoHeight)
+      logicalHeight <= 0 || width > kDkc1VideoWidescreenWidth * maxScale ||
+      height > kDkc1VideoHeight * maxScale)
     return;
   const size_t bytes = (size_t)width * (size_t)height * 4;
   [presenter->frameLock lock];
@@ -498,11 +512,26 @@ void Dkc1MacMetalPresenterQueueFrame(
   frame->width = width;
   frame->height = height;
   frame->presentationWidth = framePresentationWidth;
+  frame->logicalHeight = logicalHeight;
+  frame->hd = hd;
   frame->sequence = ++presenter->nextSequence;
   frame->info = *info;
   presenter->tail = (presenter->tail + 1) % kDkc1MetalFrameSlots;
   presenter->count++;
   [presenter->frameLock unlock];
+}
+
+void Dkc1MacMetalPresenterQueueFrame(
+    const uint32_t *pixels, int width, int height, int framePresentationWidth,
+    const Dkc1MacPresentationFrameInfo *info) {
+  QueueFrame(pixels, width, height, framePresentationWidth, height, NO, info);
+}
+
+void Dkc1MacMetalPresenterQueueHdFrame(
+    const uint32_t *pixels, int width, int height, int framePresentationWidth,
+    int logicalHeight, const Dkc1MacPresentationFrameInfo *info) {
+  QueueFrame(pixels, width, height, framePresentationWidth, logicalHeight, YES,
+             info);
 }
 
 void Dkc1MacMetalPresenterSetGeometry(int newPresentationWidth,

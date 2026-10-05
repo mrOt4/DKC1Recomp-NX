@@ -1,6 +1,7 @@
 #include "dkc1_blank_scan.h"
 #include "dkc1_invariant_monitor.h"
 #include "dkc1_game.h"
+#include "dkc1_hd.h"
 #include "dkc1_video.h"
 #include "input_playback.h"
 #include "wram_dump.h"
@@ -735,6 +736,37 @@ int main(int argc, char **argv) {
          audio_active_frames, audio_silent_frames, audio_rendered_frames,
          audio_nonzero_samples, audio_peak,
          (unsigned long long)audio_fnv1a, state_events);
+  if (Dkc1HdEnabled()) {
+    Dkc1HdStats hd;
+    Dkc1HdGetStats(&hd);
+    printf("\nhd_stats status=\"%s\" frames=%llu pixels=%llu uncomposed=%llu "
+           "black=%llu self_check_fail=%llu main_identity=%llu "
+           "sub_identity=%llu ref_mismatch=%llu equiv_mismatch=%llu "
+           "pack_hits=%llu pack_misses=%llu under_checked=%llu "
+           "under_mismatch=%llu cover_checked=%llu cover_mismatch=%llu "
+           "compose_ms_per_frame=%.3f",
+           Dkc1HdStatus(), (unsigned long long)hd.frames,
+           (unsigned long long)hd.pixels, (unsigned long long)hd.uncomposed,
+           (unsigned long long)hd.black,
+           (unsigned long long)hd.self_check_fail,
+           (unsigned long long)hd.main_identity,
+           (unsigned long long)hd.sub_identity,
+           (unsigned long long)hd.ref_mismatch,
+           (unsigned long long)hd.equiv_mismatch,
+           (unsigned long long)hd.pack_hits,
+           (unsigned long long)hd.pack_misses,
+           (unsigned long long)hd.under_checked,
+           (unsigned long long)hd.under_mismatch,
+           (unsigned long long)hd.cover_checked,
+           (unsigned long long)hd.cover_mismatch,
+           hd.frames ? hd.compose_ns / 1e6 / (double)hd.frames : 0.0);
+    const char *hd_output = getenv("DKC1_HD_PPM");
+    if (hd_output && *hd_output && !Dkc1HdWritePpm(hd_output))
+      fprintf(stderr, "could not write %s\n", hd_output);
+    const char *gbuf_output = getenv("DKC1_HD_GBUF");
+    if (gbuf_output && *gbuf_output && !Dkc1HdWriteGbuffer(gbuf_output))
+      fprintf(stderr, "could not write %s\n", gbuf_output);
+  }
   const char *frame_output = getenv("DKC1_FRAME_PPM");
   if (frame_output && *frame_output) {
     if (!WriteFramePpm(frame_output, pixels, frame_width, kHeight,

@@ -26,12 +26,12 @@
 #define DECLARE(type,name) static type p##name;
 GL_API(DECLARE)
 #undef DECLARE
-enum { Flat,Reconstruct,Lines,Beam,Down,Blur,Compose,PassCount };
+enum { Flat,Reconstruct,Lines,Beam,Down,Blur,Compose,Hd,PassCount };
 typedef struct Target { GLuint texture; int w,h; } Target;
 static SDL_Window *s_window;
 static SDL_GLContext s_context;
 static GLuint s_programs[PassCount],s_vao,s_fbo;
-static Target s_input,s_lines,s_beam,s_glow[2],s_halo[2];
+static Target s_input,s_hd_input,s_lines,s_beam,s_glow[2],s_halo[2];
 static const char *vertex_source=
   "#version 330 core\nout vec2 v_uv;\n"
   "uniform int final_pass;\n"
@@ -73,7 +73,7 @@ static bool Pass(int index,Target *source,Target *target,int x,int y,int w,int h
   u[0]=(float)source->w; u[1]=(float)source->h;
   pUniform1fv(pGetUniformLocation(s_programs[index],"u"),27,u);
   int final=target==NULL; pUniform1iv(pGetUniformLocation(s_programs[index],"final_pass"),1,&final);
-  bool linear=index==Down || index==Blur || index==Compose || (index==Flat && u[4]!=0);
+  bool linear=index==Down || index==Blur || index==Compose || index==Hd || (index==Flat && u[4]!=0);
   Bind(0,source,linear);
   if (index==Compose) { Bind(1,&s_glow[0],true); Bind(2,&s_halo[0],true); }
   pBindVertexArray(s_vao); glDrawArrays(GL_TRIANGLE_STRIP,0,4);
@@ -99,7 +99,7 @@ bool Dkc1WindowsGraphicsInit(SDL_Window *window) {
   }
   pDeleteShader(vertex); pGenVertexArrays(1,&s_vao);pGenFramebuffers(1,&s_fbo);
   SDL_GL_SetSwapInterval(0); /* QPC is the single 60 Hz producer authority. */
-  fprintf(stderr,"[windows-graphics] OpenGL %s; all 7 shader passes ready\n",glGetString(GL_VERSION));
+  fprintf(stderr,"[windows-graphics] OpenGL %s; all %d shader passes ready\n",glGetString(GL_VERSION),(int)PassCount);
   return true;
 }
 void Dkc1WindowsGraphicsDraw(const uint32_t *pixels,int w,int h,int display_width,const Dkc1GraphicsSettings *settings) {
@@ -140,11 +140,29 @@ void Dkc1WindowsGraphicsDraw(const uint32_t *pixels,int w,int h,int display_widt
   }
   if(!ok)fprintf(stderr,"[windows-graphics] render pass failed\n");
 }
+/* HD texture surface (runner/dkc1_hd.c): w x h pixels that represent a
+ * logical display_width x logical_height picture. Fitted like the native
+ * frame; Reconstruct/CRT do not apply to an already upscaled image. */
+void Dkc1WindowsGraphicsDrawHd(const uint32_t *pixels,int w,int h,int display_width,int logical_height) {
+  if(!s_context||display_width<1||logical_height<1)return;
+  SDL_GL_MakeCurrent(s_window,s_context);
+  int ow,oh;SDL_GL_GetDrawableSize(s_window,&ow,&oh);if(ow<1||oh<1)return;
+  int vw=ow,vh=ow*logical_height/display_width;
+  if(vh>oh){vh=oh;vw=oh*display_width/logical_height;}
+  int x=(ow-vw)/2,y=(oh-vh)/2;
+  pBindFramebuffer(GL_FRAMEBUFFER,0);glViewport(0,0,ow,oh);glClearColor(0,0,0,1);glClear(GL_COLOR_BUFFER_BIT);
+  pActiveTexture(GL_TEXTURE0);
+  if(!Ensure(&s_hd_input,w,h,true))return;
+  glBindTexture(GL_TEXTURE_2D,s_hd_input.texture);
+  glTexSubImage2D(GL_TEXTURE_2D,0,0,0,w,h,GL_BGRA,GL_UNSIGNED_BYTE,pixels);
+  float u[27]={(float)w,(float)h,(float)vw,(float)vh};
+  if(!Pass(Hd,&s_hd_input,NULL,x,y,vw,vh,u))fprintf(stderr,"[windows-graphics] HD pass failed\n");
+}
 void Dkc1WindowsGraphicsSwap(void){if(s_context)SDL_GL_SwapWindow(s_window);}
 void Dkc1WindowsGraphicsClose(void){
   if(!s_context)return;
-  Target *targets[]={&s_input,&s_lines,&s_beam,&s_glow[0],&s_glow[1],&s_halo[0],&s_halo[1]};
-  for(int i=0;i<7;i++){glDeleteTextures(1,&targets[i]->texture);memset(targets[i],0,sizeof(Target));}
+  Target *targets[]={&s_input,&s_hd_input,&s_lines,&s_beam,&s_glow[0],&s_glow[1],&s_halo[0],&s_halo[1]};
+  for(int i=0;i<8;i++){glDeleteTextures(1,&targets[i]->texture);memset(targets[i],0,sizeof(Target));}
   for(int i=0;i<PassCount;i++){pDeleteProgram(s_programs[i]);s_programs[i]=0;}
   pDeleteVertexArrays(1,&s_vao);pDeleteFramebuffers(1,&s_fbo);SDL_GL_DeleteContext(s_context);s_context=NULL;
 }

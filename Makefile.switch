@@ -60,6 +60,7 @@ GAME_CFILES := \
 	$(TOPDIR)/runner/dkc1_baby_kong.c \
 	$(TOPDIR)/runner/dkc1_baby_kong_animation.c \
 	$(TOPDIR)/runner/dkc1_baby_kong_movement.c \
+	$(TOPDIR)/runner/dkc1_hd.c \
 	$(TOPDIR)/runner/dkc1_margin_proxy.c \
 	$(TOPDIR)/runner/dkc1_ws_trace.c \
 	$(TOPDIR)/runner/input_playback.c \
@@ -73,7 +74,8 @@ GAME_CFILES := \
 	$(TOPDIR)/runner/headless_host.c \
 	$(TOPDIR)/runner/sdl_host.c \
 	$(TOPDIR)/runner/dkc1_haptics.c \
-	$(TOPDIR)/runner/switch_msu1_stub.c \
+	$(TOPDIR)/runner/dkc1_msu1.c \
+	$(TOPDIR)/runner/dkc1_stb_vorbis.c \
 	$(TOPDIR)/runner/desktop_audio_rate.c \
 	$(TOPDIR)/runner/desktop_rewind.c \
 	$(TOPDIR)/runner/desktop_input.c \
@@ -200,11 +202,11 @@ $(OUTPUT).nro	:	$(OUTPUT).elf $(OUTPUT).nacp
 
 # Explicit link through a response file: generated recomp trees put
 # hundreds of objects on the link line, past Windows' CreateProcess
-# limit ("Argument list too long").
+# limit ("Argument list too long"). $(file) writes it from make itself:
+# a shell echo loop is one command line, which overflows on Linux too.
 $(OUTPUT).elf	:	$(OFILES)
 	@echo linking $(notdir $@)
-	@rm -f $(DEPSDIR)/objects.rsp
-	@$(foreach o,$(OFILES),echo $(o) >> $(DEPSDIR)/objects.rsp;)
+	$(file >$(DEPSDIR)/objects.rsp,$(OFILES))
 	@$(LD) $(LDFLAGS) @$(DEPSDIR)/objects.rsp $(LIBPATHS) $(LIBS) -o $@
 	@$(NM) -CSn $@ > $(OUTPUT).lst
 

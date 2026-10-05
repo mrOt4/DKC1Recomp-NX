@@ -8,7 +8,22 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
-#ifdef _WIN32
+
+/* Compressed packs (tools/msu1_compress.py): Ogg Vorbis tracks decoded in
+ * small chunks from disk, so they need neither mmap nor the whole track in
+ * memory. Header-only here; the implementation is built in
+ * runner/dkc1_stb_vorbis.c. */
+#define STB_VORBIS_HEADER_ONLY
+#define STB_VORBIS_NO_PUSHDATA_API
+#include "../third_party/stb_vorbis/stb_vorbis.c"
+
+#if defined(__SWITCH__)
+/* newlib has no mmap: Switch plays compressed (.ogg) packs only. */
+#define DKC1_MSU1_NO_MMAP 1
+#endif
+
+#ifdef DKC1_MSU1_NO_MMAP
+#elif defined(_WIN32)
 #include <windows.h>
 #include <io.h>
 #define open(path, flags) _open(path, (flags) | _O_BINARY)
@@ -43,6 +58,7 @@ enum {
   kMsuMaximumTheme = 31,
   kMsuTrackCount = kMsuMaximumTheme + 1,
   kSpcMuteRomOffset = 0x0AA9E5,
+  kMsuVorbisChunkFrames = 2048,
 };
 
 typedef struct Dkc1MsuTrack {
@@ -52,6 +68,8 @@ typedef struct Dkc1MsuTrack {
   uint32_t loop_frame;
   int descriptor;
   bool present;
+  bool vorbis;            /* compressed: decoded from `path` on demand */
+  char path[PATH_MAX];
 } Dkc1MsuTrack;
 
 struct Dkc1Msu1 {
@@ -66,6 +84,11 @@ struct Dkc1Msu1 {
   unsigned track_number;
   int16_t current_sample[2];
   int16_t next_sample[2];
+  /* Vorbis streaming state for the current compressed track. */
+  stb_vorbis *decoder;
+  int16_t chunk[kMsuVorbisChunkFrames * 2];
+  int chunk_frames;
+  int chunk_pos;
   double gain;
   bool loop;
   bool playing;
@@ -84,16 +107,23 @@ static void SetError(char *error, size_t error_size, const char *message) {
     snprintf(error, error_size, "%s", message ? message : "unknown error");
 }
 
+#ifndef DKC1_MSU1_NO_MMAP
 static uint32_t ReadLittle32(const uint8_t bytes[4]) {
   return (uint32_t)bytes[0] | ((uint32_t)bytes[1] << 8) |
          ((uint32_t)bytes[2] << 16) | ((uint32_t)bytes[3] << 24);
 }
+#endif
 
 static int16_t ReadLittle16(const uint8_t bytes[2]) {
   return (int16_t)(uint16_t)(bytes[0] | ((uint16_t)bytes[1] << 8));
 }
 
 static void CloseTrack(Dkc1Msu1 *player) {
+  if (player->decoder)
+    stb_vorbis_close(player->decoder);
+  player->decoder = NULL;
+  player->chunk_frames = 0;
+  player->chunk_pos = 0;
   player->track = NULL;
   player->playing = false;
   player->track_number = 0;
@@ -107,7 +137,28 @@ static void CloseTrack(Dkc1Msu1 *player) {
 static bool SeekFrame(Dkc1Msu1 *player, uint32_t frame) {
   if (!player->track || frame >= player->total_frames)
     return false;
+  if (player->decoder) {
+    if (!stb_vorbis_seek(player->decoder, frame))
+      return false;
+    player->chunk_frames = 0;
+    player->chunk_pos = 0;
+  }
   player->source_frame = frame;
+  return true;
+}
+
+static bool ReadVorbisFrame(Dkc1Msu1 *player, int16_t sample[2]) {
+  if (player->chunk_pos >= player->chunk_frames) {
+    player->chunk_frames = stb_vorbis_get_samples_short_interleaved(
+        player->decoder, 2, player->chunk, kMsuVorbisChunkFrames * 2);
+    player->chunk_pos = 0;
+    if (player->chunk_frames <= 0)
+      return false;
+  }
+  sample[0] = player->chunk[player->chunk_pos * 2];
+  sample[1] = player->chunk[player->chunk_pos * 2 + 1];
+  player->chunk_pos++;
+  player->source_frame++;
   return true;
 }
 
@@ -118,6 +169,8 @@ static bool ReadFrame(Dkc1Msu1 *player, int16_t sample[2]) {
     if (!player->loop || !SeekFrame(player, player->loop_frame))
       return false;
   }
+  if (player->track->vorbis)
+    return ReadVorbisFrame(player, sample);
   const size_t offset =
       kMsuPcmHeaderSize + (size_t)player->source_frame * 4u;
   if (offset > player->track->mapping_size ||
@@ -133,17 +186,63 @@ static bool ReadFrame(Dkc1Msu1 *player, int16_t sample[2]) {
 static void UnmapTrack(Dkc1MsuTrack *track) {
   if (!track)
     return;
+#ifndef DKC1_MSU1_NO_MMAP
   if (track->mapping && track->mapping_size)
     (void)munmap((void *)track->mapping, track->mapping_size);
   if (track->descriptor >= 0)
     (void)close(track->descriptor);
+#endif
   *track = (Dkc1MsuTrack){.descriptor = -1};
+}
+
+/* Registers a compressed track: length from the stream, loop frame from the
+ * MSU1_LOOP comment written by tools/msu1_compress.py. */
+static int ProbeVorbisFile(const char *path, Dkc1MsuTrack *track) {
+  FILE *probe = fopen(path, "rb");
+  if (!probe)
+    return 0;
+  fclose(probe);
+  int error = 0;
+  stb_vorbis *decoder = stb_vorbis_open_filename(path, &error, NULL);
+  if (!decoder)
+    return -1;
+  const stb_vorbis_info info = stb_vorbis_get_info(decoder);
+  const unsigned frames = stb_vorbis_stream_length_in_samples(decoder);
+  uint32_t loop = 0;
+  const stb_vorbis_comment comments = stb_vorbis_get_comment(decoder);
+  for (int i = 0; i < comments.comment_list_length; i++) {
+    const char *entry = comments.comment_list[i];
+    static const char kKey[] = "MSU1_LOOP=";
+    size_t k = 0;
+    while (kKey[k] && entry[k] &&
+           (entry[k] == kKey[k] || entry[k] == kKey[k] + ('a' - 'A')))
+      k++;
+    if (!kKey[k])
+      loop = (uint32_t)strtoul(entry + k, NULL, 10);
+  }
+  stb_vorbis_close(decoder);
+  if (info.channels != 2 || info.sample_rate != kMsuInputRate || frames < 2 ||
+      snprintf(track->path, sizeof track->path, "%s", path) >=
+          (int)sizeof track->path)
+    return -1;
+  track->total_frames = frames;
+  track->loop_frame = loop;
+  track->vorbis = true;
+  track->present = true;
+  return 1;
 }
 
 /* Map each PCM once during host startup. Playback then performs deterministic
  * pointer reads instead of tens of thousands of stdio calls on the frame-
  * critical thread. MADV_SEQUENTIAL lets the kernel keep the next PCM pages
  * ahead of the mixer without changing the sample timeline. */
+#ifdef DKC1_MSU1_NO_MMAP
+static int MapTrackFile(const char *path, Dkc1MsuTrack *track) {
+  (void)path;
+  (void)track;
+  return 0;
+}
+#else
 static int MapTrackFile(const char *path, Dkc1MsuTrack *track) {
   if (!path || !track)
     return -1;
@@ -184,20 +283,24 @@ static int MapTrackFile(const char *path, Dkc1MsuTrack *track) {
   track->present = true;
   return 1;
 }
+#endif
 
 static int CacheTrack(Dkc1Msu1 *player, unsigned track_number) {
   if (!player || track_number == 0 || track_number > kMsuTrackCount)
     return -1;
   Dkc1MsuTrack *track = &player->tracks[track_number - 1u];
-  const char *patterns[] = {"%s/track-%u.pcm", "%s/dkc_msu-%u.pcm"};
+  /* Uncompressed PCM first (exact original), then compressed Vorbis. */
+  const char *patterns[] = {"%s/track-%u.pcm", "%s/dkc_msu-%u.pcm",
+                            "%s/track-%u.ogg", "%s/dkc_msu-%u.ogg"};
   char path[PATH_MAX];
   for (size_t i = 0; i < sizeof patterns / sizeof patterns[0]; i++) {
     if (snprintf(path, sizeof path, patterns[i], player->directory,
                  track_number) >= (int)sizeof path)
       continue;
-    const int mapped = MapTrackFile(path, track);
-    if (mapped != 0)
-      return mapped;
+    const int found = i < 2 ? MapTrackFile(path, track)
+                            : ProbeVorbisFile(path, track);
+    if (found != 0)
+      return found;
   }
   return 0;
 }
@@ -218,6 +321,14 @@ static bool OpenTrack(Dkc1Msu1 *player, unsigned theme) {
                  player->loop_frame < player->total_frames;
   player->track_number = track;
   player->phase = 0;
+  if (cached->vorbis) {
+    int error = 0;
+    player->decoder = stb_vorbis_open_filename(cached->path, &error, NULL);
+    if (!player->decoder) {
+      CloseTrack(player);
+      return false;
+    }
+  }
   if (!SeekFrame(player, 0) ||
       !ReadFrame(player, player->current_sample) ||
       !ReadFrame(player, player->next_sample)) {

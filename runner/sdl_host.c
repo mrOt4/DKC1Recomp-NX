@@ -6,6 +6,7 @@
  */
 #include "dkc1_blank_scan.h"
 #include "dkc1_baby_kong.h"
+#include "dkc1_hd.h"
 #include "dkc1_debug_dump.h"
 #include "dkc1_flight_recorder.h"
 #include "dkc1_game.h"
@@ -172,6 +173,9 @@ static uint8_t s_pixels[kDkc1VideoWidescreenWidth * kDkc1VideoHeight * 4];
 static SDL_Window *s_window;
 static SDL_Renderer *s_renderer;
 static SDL_Texture *s_texture;
+/* HD texture surface for the SDL renderer path (Switch). */
+static SDL_Texture *s_hd_texture;
+static int s_hd_texture_width, s_hd_texture_height;
 static SDL_AudioDeviceID s_audio_device;
 static SDL_GameController *s_controllers[2];
 #define s_controller s_controllers[0]
@@ -855,7 +859,8 @@ static void UpdateTitle(void) {
                          Dkc1VideoGetAspect(), Dkc1VideoGetEdgePolicy(),
                          Dkc1DebugLayerMask(),
                          Dkc1DebugProvenanceOverlay(), s_msu1 != NULL,
-                         Dkc1BabyKongEnabled(), Dkc1BabyKongReady());
+                         Dkc1BabyKongEnabled(), Dkc1BabyKongReady(),
+                         Dkc1HdUserEnabled(), Dkc1HdReady());
   Dkc1MacUpdateGraphicsMenuState(s_graphics.display,s_graphics.upscaler,s_graphics.screen);
 }
 
@@ -887,6 +892,23 @@ static void ChooseBabyKongRom(void) {
   } else {
     ShowError("Unsupported DKC3 ROM", error);
     snprintf(s_status, sizeof s_status, "Baby Kong: %.160s", error);
+  }
+  free(path);
+}
+
+static void ChooseHdPack(void) {
+  char *path = Dkc1MacChooseHdPack();
+  if (!path)
+    return;
+  char error[640];
+  if (Dkc1HdLoadPack(path, error, sizeof error)) {
+    Dkc1HdSetEnabled(true);
+    Dkc1MacSetHdPack(path);
+    Dkc1MacSetHdEnabled(1);
+    snprintf(s_status, sizeof s_status, "%s", Dkc1HdStatus());
+  } else {
+    ShowError("Unsupported HD pack", error);
+    snprintf(s_status, sizeof s_status, "HD pack: %.160s", error);
   }
   free(path);
 }
@@ -1163,7 +1185,77 @@ static void InitDisplayLink(void) {
 #endif
 }
 
+/* Present dkc1_hd.c's surface instead of the native frame. Same fit as the
+ * native picture (PresentationWidth() x kDkc1VideoHeight); the color filter,
+ * Reconstruct and CRT apply to native pixels only. */
+static bool PrepareHdPresentation(void) {
+  int hd_width, hd_height;
+  const uint32_t *hd = Dkc1HdOutput(&hd_width, &hd_height, NULL);
+  if (!hd)
+    return false;
+#ifdef _WIN32
+  Dkc1WindowsGraphicsDrawHd(hd, hd_width, hd_height, PresentationWidth(),
+                            kDkc1VideoHeight);
+  return true;
+#endif
+  if (s_metal_presenter_active) {
+    Dkc1MacPresentationFrameInfo info = {
+      .host_frame = s_host_frame,
+      .camera_x = ReadWram16(0x088b),
+      .camera_y = ReadWram16(0x0895),
+    };
+    for (int layer = 0; layer < 4; layer++) {
+      info.bg_hscroll[layer] = g_ppu->hScroll[layer];
+      info.bg_vscroll[layer] = g_ppu->vScroll[layer];
+    }
+    Dkc1MacMetalPresenterQueueHdFrame(hd, hd_width, hd_height,
+                                      PresentationWidth(), kDkc1VideoHeight,
+                                      &info);
+    return true;
+  }
+  if (!s_hd_texture || s_hd_texture_width != hd_width ||
+      s_hd_texture_height != hd_height) {
+    if (s_hd_texture)
+      SDL_DestroyTexture(s_hd_texture);
+    s_hd_texture = SDL_CreateTexture(s_renderer, SDL_PIXELFORMAT_ARGB8888,
+                                     SDL_TEXTUREACCESS_STREAMING, hd_width,
+                                     hd_height);
+    if (!s_hd_texture)
+      return false;
+    (void)SDL_SetTextureScaleMode(s_hd_texture, SDL_ScaleModeLinear);
+    s_hd_texture_width = hd_width;
+    s_hd_texture_height = hd_height;
+  }
+  SDL_Rect destination;
+  SDL_Rect *destination_ptr = NULL;
+  int output_width = 0, output_height = 0;
+  if (s_fullscreen &&
+      SDL_GetRendererOutputSize(s_renderer, &output_width, &output_height) == 0 &&
+      output_width > 0 && output_height > 0) {
+    const int presentation_width = PresentationWidth();
+    if ((int64_t)output_width * kDkc1VideoHeight <=
+        (int64_t)output_height * presentation_width) {
+      destination.w = output_width;
+      destination.h = (output_width * kDkc1VideoHeight +
+                       presentation_width / 2) / presentation_width;
+    } else {
+      destination.h = output_height;
+      destination.w = (output_height * presentation_width +
+                       kDkc1VideoHeight / 2) / kDkc1VideoHeight;
+    }
+    destination.x = (output_width - destination.w) / 2;
+    destination.y = (output_height - destination.h) / 2;
+    destination_ptr = &destination;
+  }
+  SDL_UpdateTexture(s_hd_texture, NULL, hd, hd_width * 4);
+  SDL_RenderClear(s_renderer);
+  SDL_RenderCopy(s_renderer, s_hd_texture, NULL, destination_ptr);
+  return true;
+}
+
 static void PreparePresentation(void) {
+  if (PrepareHdPresentation())
+    return;
   const uint8_t *display=Dkc1DesktopColorFilterApply(&s_color_filter,s_pixels,
       s_display_pixels,(size_t)s_width*kDkc1VideoHeight);
   if (!display) display=s_pixels;
@@ -2023,6 +2115,18 @@ void Dkc1MacMenuCommand(int command) {
     case kDkc1MacMenuChooseBabyKongRom:
       ChooseBabyKongRom();
       break;
+    case kDkc1MacMenuToggleHd:
+      if (!Dkc1HdReady()) {
+        ChooseHdPack();
+      } else {
+        Dkc1HdSetEnabled(!Dkc1HdUserEnabled());
+        Dkc1MacSetHdEnabled(Dkc1HdUserEnabled());
+        snprintf(s_status, sizeof s_status, "%s", Dkc1HdStatus());
+      }
+      break;
+    case kDkc1MacMenuChooseHdPack:
+      ChooseHdPack();
+      break;
     case kDkc1MacMenuChooseMusicPack: {
       char *path = Dkc1MacChooseMsu1();
       if (path) {
@@ -2201,6 +2305,8 @@ static void Cleanup(uint8_t *rom) {
   Dkc1BabyKongUnload();
   if (s_audio_device)
     SDL_CloseAudioDevice(s_audio_device);
+  if (s_hd_texture)
+    SDL_DestroyTexture(s_hd_texture);
   if (s_texture)
     SDL_DestroyTexture(s_texture);
   if (s_renderer)
@@ -2356,6 +2462,21 @@ int main(int argc, char **argv) {
         baby_enabled ? EnvironmentEnabled("DKC1_BABY_KONG")
                      : Dkc1MacSavedBabyKongEnabled() != 0);
   }
+
+  /* HD textures: DKC1_HD_PACK / DKC1_HD_DISABLE (read by dkc1_hd.c) win
+   * over the saved preference, like the MSU-1 and Baby Kong variables. */
+  if (!getenv("DKC1_HD_PACK") && !Dkc1HdReady()) {
+    char *hd_pack = Dkc1MacSavedHdPack();
+    if (hd_pack) {
+      char hd_error[640];
+      if (!Dkc1HdLoadPack(hd_pack, hd_error, sizeof hd_error))
+        fprintf(stderr, "warning: HD textures disabled: %s\n", hd_error);
+      free(hd_pack);
+    }
+  }
+  if (Dkc1HdReady() && !getenv("DKC1_HD_PACK"))
+    Dkc1HdSetEnabled(!EnvironmentEnabled("DKC1_HD_DISABLE") &&
+                     Dkc1MacSavedHdEnabled() != 0);
 
   const char *snapshot = getenv("DKC1_SAVESTATE_INPUT");
   if (snapshot && *snapshot && !RtlLoadSnapshot(snapshot)) {

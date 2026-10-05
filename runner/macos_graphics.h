@@ -10,4 +10,8 @@
              target:(id<MTLTexture>)target viewport:(MTLViewport)viewport
            settings:(Dkc1GraphicsSettings)settings
       commandBuffer:(id<MTLCommandBuffer>)commandBuffer;
+/* Draws an HD texture surface (runner/dkc1_hd.c) fitted to the viewport. */
+- (BOOL)encodeHdPixels:(const uint32_t *)pixels width:(int)width height:(int)height
+                target:(id<MTLTexture>)target viewport:(MTLViewport)viewport
+         commandBuffer:(id<MTLCommandBuffer>)commandBuffer;
 @end

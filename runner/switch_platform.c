@@ -14,6 +14,7 @@
 
 #include <SDL.h>
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -33,8 +34,30 @@ char *Dkc1MacSavedBabyKongRom(void) { return NULL; }
 void Dkc1MacSetBabyKongRom(const char *path) { (void)path; }
 int Dkc1MacSavedBabyKongEnabled(void) { return 0; }
 void Dkc1MacSetBabyKongEnabled(int enabled) { (void)enabled; }
+/* The Switch build enables HD from sdmc:/switch/dkc1/hd/ (dkc1_hd.c). */
+char *Dkc1MacChooseHdPack(void) { return NULL; }
+char *Dkc1MacSavedHdPack(void) { return NULL; }
+void Dkc1MacSetHdPack(const char *path) { (void)path; }
+int Dkc1MacSavedHdEnabled(void) { return 1; }
+void Dkc1MacSetHdEnabled(int enabled) { (void)enabled; }
 char *Dkc1MacChooseMsu1(void) { return NULL; }
-char *Dkc1MacSavedMsu1(void) { return NULL; }
+/* No picker on Switch: a compressed pack (tools/msu1_compress.py) copied to
+ * sdmc:/switch/dkc1/msu1/ enables replacement music. Only .ogg tracks play
+ * here (no mmap for raw .pcm packs). */
+char *Dkc1MacSavedMsu1(void) {
+  static const char *const kProbes[] = {"msu1/track-1.ogg",
+                                        "msu1/dkc_msu-1.ogg"};
+  for (size_t i = 0; i < sizeof kProbes / sizeof kProbes[0]; i++) {
+    FILE *probe = fopen(kProbes[i], "rb");
+    if (probe) {
+      fclose(probe);
+      char *path = malloc(5);
+      if (path) memcpy(path, "msu1", 5);
+      return path;
+    }
+  }
+  return NULL;
+}
 void Dkc1MacClearMsu1(void) {}
 
 Dkc1MacFullscreenScaling Dkc1MacSavedFullscreenScaling(void) {
@@ -67,7 +90,8 @@ void Dkc1MacUpdateMenuState(int paused, int fullscreen,
                             Dkc1VideoAspect aspect, Dkc1EdgePolicy edge,
                             unsigned char layer_mask, int provenance,
                             int replacement_music, int baby_kong_enabled,
-                            int baby_kong_ready) {
+                            int baby_kong_ready, int hd_enabled,
+                            int hd_ready) {
   (void)paused;
   (void)fullscreen;
   (void)fullscreen_scaling;
@@ -78,6 +102,8 @@ void Dkc1MacUpdateMenuState(int paused, int fullscreen,
   (void)replacement_music;
   (void)baby_kong_enabled;
   (void)baby_kong_ready;
+  (void)hd_enabled;
+  (void)hd_ready;
 }
 
 /* Fixed handheld controls: both players on gamepads with the straight
@@ -167,6 +193,16 @@ void Dkc1MacMetalPresenterQueueFrame(
   (void)width;
   (void)height;
   (void)presentation_width;
+  (void)info;
+}
+void Dkc1MacMetalPresenterQueueHdFrame(
+    const uint32_t *pixels, int width, int height, int presentation_width,
+    int logical_height, const Dkc1MacPresentationFrameInfo *info) {
+  (void)pixels;
+  (void)width;
+  (void)height;
+  (void)presentation_width;
+  (void)logical_height;
   (void)info;
 }
 void Dkc1MacMetalPresenterSetGeometry(int presentation_width, int fullscreen) {

@@ -44,6 +44,15 @@ Player 1 and 2 autodetect pads in order (a lone pad drives player 1).
 | DPad, left stick | DPad |
 | L3 / R3 (`DEBUG=1` builds only) | Quick-save / quick-load |
 
+## MSU-1 music and HD textures
+
+- Compress a PCM MSU-1 pack with `tools/msu1_compress.py --in <pack>
+  --out <ogg-pack>` (about 13 % of the original size) and copy the result
+  to `sdmc:/switch/dkc1/msu1/` (`dkc_msu-N.ogg` or `track-N.ogg`). Raw `.pcm`
+  packs are not supported on Switch (no mmap).
+- An HD texture pack (`tools/hd_pack.py`) in `sdmc:/switch/dkc1/hd/`
+  (`tiles.bin`) enables HD textures in 16:9/16:10.
+
 ## Presentation
 
 - Fixed SDL window on the GLES2-accelerated renderer; the framebuffer
@@ -55,7 +64,7 @@ Player 1 and 2 autodetect pads in order (a lone pad drives player 1).
 
 ## Deliberately excluded on Switch
 
-Native menus, ROM/music/file pickers, MSU-1 packs, Baby Kong ROM,
+Native menus, ROM/music/file pickers, raw (.pcm) MSU-1 packs, Baby Kong ROM,
 pause menu, overlay equivalents, TCP debug server, co-sim, oracle,
 mods, GLSL/Metal/GL presenters, post-mortem minidumps, tier-2 JSON
 manifests. `log.flag` file logging and the `[saves]` SRAM log lines
@@ -69,6 +78,6 @@ stay.
 | `runner/sdl_host.c` (`__SWITCH__`) | SD bring-up, `sdmc:/switch/dkc1/rom.smc` resolution, fixed 720p window, SDL-clock frame pacer, raw-joystick input, applet tick, SRAM seed + 5 s dirty-check writer, L3/R3 debug |
 | `runner/switch_platform.c` | `Dkc1Mac*` surface: fixed handheld settings/controls, null pickers, no-op menus/links/presenters |
 | `runner/switch_gamepad.c` | HID-order raw joystick reader (A/B/X/Y, ZL/ZR triggers, +/-/Start/Select, stick-as-DPad) + native 2-pad controller applet |
-| `runner/switch_msu1_stub.c` | no-op MSU-1 (needs mmap + pack UX) |
+| `runner/dkc1_msu1.c` + `runner/dkc1_stb_vorbis.c` | MSU-1 music from a compressed (Ogg Vorbis) pack in `sdmc:/switch/dkc1/msu1/`, streamed from the SD card |
 | `snesrecomp/runner/src/switch/` | framework: SD bring-up, applet tick, exit/focus hooks, ROM resolver (new files in the pin) |
 | `snesrecomp/runner/switch.mk` | framework source fragment for make builds |

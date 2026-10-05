@@ -24,6 +24,11 @@ int Dkc1MacMetalPresenterStart(void *native_window, double preferred_hz,
 void Dkc1MacMetalPresenterQueueFrame(
     const uint32_t *pixels, int width, int height, int presentation_width,
     const Dkc1MacPresentationFrameInfo *info);
+/* HD texture surface (dkc1_hd.c): width x height pixels that represent a
+ * presentation_width x logical_height picture. Reconstruct/CRT are bypassed. */
+void Dkc1MacMetalPresenterQueueHdFrame(
+    const uint32_t *pixels, int width, int height, int presentation_width,
+    int logical_height, const Dkc1MacPresentationFrameInfo *info);
 void Dkc1MacMetalPresenterSetGeometry(int presentation_width, int fullscreen);
 void Dkc1MacMetalPresenterSetScaling(Dkc1MacFullscreenScaling scaling);
 void Dkc1MacMetalPresenterSetActive(int active);

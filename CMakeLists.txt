@@ -72,6 +72,7 @@ set(DKC1_RUNNER_SOURCES
     runner/dkc1_baby_kong.c
     runner/dkc1_baby_kong_animation.c
     runner/dkc1_baby_kong_movement.c
+    runner/dkc1_hd.c
     runner/dkc1_margin_proxy.c
     runner/dkc1_ws_trace.c
     runner/input_playback.c
@@ -138,6 +139,7 @@ if(APPLE)
         runner/headless_host.c
         runner/dkc1_haptics.c
         runner/dkc1_msu1.c
+        runner/dkc1_stb_vorbis.c
         runner/desktop_audio_rate.c
         runner/desktop_rewind.c
         runner/desktop_input.c
@@ -190,7 +192,8 @@ endif()
 if(WIN32)
     add_executable(dkc1_windows ${DKC1_ENGINE_SOURCES} ${DKC1_SNESRECOMP_GEN_SOURCES}
         ${DKC1_RUNNER_SOURCES} runner/headless_host.c runner/sdl_host.c
-        runner/dkc1_haptics.c runner/dkc1_msu1.c runner/desktop_audio_rate.c
+        runner/dkc1_haptics.c runner/dkc1_msu1.c runner/dkc1_stb_vorbis.c
+        runner/desktop_audio_rate.c
         runner/desktop_rewind.c runner/desktop_input.c runner/desktop_refresh.c
         runner/desktop_crt.c runner/desktop_filter.c runner/desktop_graphics.c
         runner/windows_platform.c runner/windows_graphics.c runner/windows_music_pack.c
@@ -213,7 +216,7 @@ if(WIN32)
     add_test(NAME windows_graphics COMMAND dkc1_windows --graphics-test)
     set_tests_properties(windows_graphics PROPERTIES TIMEOUT 60)
     add_executable(test_windows_music tests/test_windows_music.c
-        runner/windows_music_pack.c runner/dkc1_msu1.c)
+        runner/windows_music_pack.c runner/dkc1_msu1.c runner/dkc1_stb_vorbis.c)
     target_include_directories(test_windows_music PRIVATE runner)
     target_compile_definitions(test_windows_music PRIVATE _CRT_SECURE_NO_WARNINGS)
     target_link_libraries(test_windows_music PRIVATE miniz ole32)

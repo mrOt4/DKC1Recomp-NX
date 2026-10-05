@@ -1,5 +1,6 @@
 #include "dkc1_game.h"
 #include "dkc1_baby_kong.h"
+#include "dkc1_hd.h"
 #include "dkc1_video.h"
 #include "dkc1_terrain.h"
 #include "dkc1_wall_seams.h"
@@ -64,6 +65,7 @@ static void Dkc1InterpreterInitialColumnCount(CpuState *cpu,
 
 static void Dkc1Initialize(void) {
   Dkc1BabyKongInitializeFromEnvironment();
+  Dkc1HdInitializeFromEnvironment();
   /* The main engine can reach both initializers while executing through the
    * bank-$00 HiROM interpreter mirror. Generated-C adapters alone therefore
    * miss those entries. Mirror the same two constant substitutions at the
@@ -2246,6 +2248,7 @@ void Dkc1DrawPpuFrame(void) {
     PpuSetWidescreenPresentationXBias(g_ppu, 0);
   }
 
+  Dkc1HdPrepareFrame(g_ppu);
   Dkc1BabyKongPrepareFrame(g_ppu, g_ram, presentation_bias);
 
   dma_startDma(g_dma, g_snesrecomp_last_hdmaen, true);
@@ -2293,6 +2296,7 @@ void Dkc1DrawPpuFrame(void) {
   }
 
   Dkc1BabyKongDrawFrame(g_ppu);
+  Dkc1HdFinishFrame(g_ppu, Dkc1VideoWidth());
 
   /* Model the VBlank boundary after the visible lines so the PPU reloads its
    * internal OAM port from OAMADD before the next frame's OAM DMA. */

@@ -135,6 +135,16 @@ char *Dkc1MacSavedBabyKongRom(void){return ReadPath(L"DKC3");}
 void Dkc1MacSetBabyKongRom(const char *p){WritePath(L"DKC3",p);}
 int Dkc1MacSavedBabyKongEnabled(void){return ReadInt(L"Mods","BabyKong",0);}
 void Dkc1MacSetBabyKongEnabled(int enabled){WriteInt(L"Mods","BabyKong",enabled!=0);}
+/* The HD pack is a folder; the dialog picks its tiles.bin. */
+char *Dkc1MacChooseHdPack(void){
+ char *path=Pick(L"Choose tiles.bin in your HD pack folder",L"HD pack index\0tiles.bin\0All files\0*.*\0");
+ if(!path)return NULL;char *slash=strrchr(path,'\\');char *other=strrchr(path,'/');if(other>slash)slash=other;
+ if(slash)*slash=0;return path;
+}
+char *Dkc1MacSavedHdPack(void){return ReadPath(L"HDPack");}
+void Dkc1MacSetHdPack(const char *p){WritePath(L"HDPack",p);}
+int Dkc1MacSavedHdEnabled(void){return ReadInt(L"Mods","HdTextures",1);}
+void Dkc1MacSetHdEnabled(int enabled){WriteInt(L"Mods","HdTextures",enabled!=0);}
 char *Dkc1MacSavedMsu1(void){return ReadPath(L"MSU1");}
 void Dkc1MacClearMsu1(void){WritePath(L"MSU1",NULL);}
 char *Dkc1MacChooseMsu1(void){
@@ -203,6 +213,7 @@ void Dkc1MacInstallMenu(void){
  HMENU edges=Sub(view,L"Level &edge");const wchar_t *edgeNames[]={L"Reflect",L"Black bars",L"Shift",L"Glide"};for(int i=0;i<4;i++)Add(edges,kDkc1MacMenuEdgeReflect+i,edgeNames[i]);
  HMENU layers=Sub(view,L"&Layers");const wchar_t *layerNames[]={L"Composite",L"BG1",L"BG2",L"BG3",L"Sprites"};for(int i=0;i<5;i++)Add(layers,kDkc1MacMenuLayerComposite+i,layerNames[i]);Add(view,kDkc1MacMenuProvenance,L"Provenance\tF1");
  Add(mods,kDkc1MacMenuToggleBabyKong,L"&Baby Kong");Add(mods,kDkc1MacMenuChooseBabyKongRom,L"Choose &DKC3 ROM...");
+ AppendMenuW(mods,MF_SEPARATOR,0,NULL);Add(mods,kDkc1MacMenuToggleHd,L"&HD Textures");Add(mods,kDkc1MacMenuChooseHdPack,L"Choose HD &pack...");
  Add(music,kDkc1MacMenuChooseMusicPack,L"Choose &MSU-1 music pack...");Add(music,kDkc1MacMenuDisableMusicPack,L"&Disable replacement music");
  ThemeMenu(s_menu,1);SetMenu(s_window,s_menu);DrawMenuBar(s_window);
 }
@@ -212,8 +223,8 @@ void Dkc1MacUpdateGraphicsMenuState(int display,int upscaler,int screen){
  int scalers[]={kDkc1MacMenuFullscreenPixelSharp,kDkc1MacMenuFullscreenSmooth,kDkc1MacMenuUpscalerReconstruct,kDkc1MacMenuFullscreenSharpBilinear};
  for(int i=0;i<4;i++){Check(scalers[i],i==upscaler);Check(kDkc1MacMenuScreenRaw+i,i==screen);}
 }
-void Dkc1MacUpdateMenuState(int paused,int fullscreen,Dkc1MacFullscreenScaling scaling,Dkc1VideoAspect aspect,Dkc1EdgePolicy edge,unsigned char layers,int provenance,int music,int baby,int ready){
- (void)scaling;(void)ready;Check(kDkc1MacMenuPause,paused);Check(kDkc1MacMenuFullscreen,fullscreen);Check(kDkc1MacMenuToggleBabyKong,baby);Check(kDkc1MacMenuChooseMusicPack,music);Check(kDkc1MacMenuProvenance,provenance);
+void Dkc1MacUpdateMenuState(int paused,int fullscreen,Dkc1MacFullscreenScaling scaling,Dkc1VideoAspect aspect,Dkc1EdgePolicy edge,unsigned char layers,int provenance,int music,int baby,int ready,int hd,int hd_ready){
+ (void)scaling;(void)ready;(void)hd_ready;Check(kDkc1MacMenuToggleHd,hd);Check(kDkc1MacMenuPause,paused);Check(kDkc1MacMenuFullscreen,fullscreen);Check(kDkc1MacMenuToggleBabyKong,baby);Check(kDkc1MacMenuChooseMusicPack,music);Check(kDkc1MacMenuProvenance,provenance);
  for(int i=0;i<3;i++)Check(kDkc1MacMenuAspectNative+i,aspect==i);for(int i=0;i<4;i++)Check(kDkc1MacMenuEdgeReflect+i,edge==i);
  int masks[]={255,1,2,4,16};for(int i=0;i<5;i++)Check(kDkc1MacMenuLayerComposite+i,layers==masks[i]);
 }
@@ -254,7 +265,8 @@ static void FillPanel(void){
  }else if(s_page==6){
   Child("BUTTON","Choose DKC3 ROM / enable Baby Kong",3400,22,75,510,38,BS_PUSHBUTTON);Child("BUTTON","Toggle Baby Kong",3401,22,125,510,38,BS_PUSHBUTTON);
   Child("BUTTON","Choose MSU-1 music folder or archive",3402,22,200,510,38,BS_PUSHBUTTON);Child("BUTTON","Disable replacement music",3403,22,250,510,38,BS_PUSHBUTTON);
-  Child("STATIC","Baby Kong requires your own DKC3 ROM. Music selection applies after restart.",0,22,320,780,60,0);
+  Child("BUTTON","Choose HD pack / enable HD textures",3404,22,320,510,38,BS_PUSHBUTTON);Child("BUTTON","Toggle HD textures",3405,22,370,510,38,BS_PUSHBUTTON);
+  Child("STATIC","Baby Kong requires your own DKC3 ROM. Music selection applies after restart. HD packs are generated from your own ROM (tools/hd_pack.py) and apply in 16:9 / 16:10.",0,22,420,780,60,0);
  }else Child("STATIC","DKC1Recomp\nOriginal game: Rare / Nintendo\nNative host and tools: project contributors\nSNESrecomp and SDL contributors\n\nNo ROM or game assets are included.",0,22,80,770,280,0);
  InvalidateRect(s_panel,NULL,TRUE);
 }
@@ -292,7 +304,7 @@ static LRESULT CALLBACK PanelProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
   if(id==1100||id==1101){s_resume=id==1100;DestroyWindow(hwnd);s_panel=NULL;return 0;}
   if(id==1202){Dkc1MacMenuCommand(kDkc1MacMenuQuit);DestroyWindow(hwnd);s_panel=NULL;return 0;}
   if(id==1200||id==1201){Dkc1MacMenuCommand(id==1200?kDkc1MacMenuQuickSave:kDkc1MacMenuQuickLoad);FillPanel();return 0;}
-  if(id>=3400&&id<=3403){int commands[]={kDkc1MacMenuChooseBabyKongRom,kDkc1MacMenuToggleBabyKong,kDkc1MacMenuChooseMusicPack,kDkc1MacMenuDisableMusicPack};Dkc1MacMenuCommand(commands[id-3400]);return 0;}
+  if(id>=3400&&id<=3405){int commands[]={kDkc1MacMenuChooseBabyKongRom,kDkc1MacMenuToggleBabyKong,kDkc1MacMenuChooseMusicPack,kDkc1MacMenuDisableMusicPack,kDkc1MacMenuChooseHdPack,kDkc1MacMenuToggleHd};Dkc1MacMenuCommand(commands[id-3400]);return 0;}
   if(HIWORD(wp)==CBN_SELCHANGE){int index=(int)SendMessageW((HWND)lp,CB_GETCURSEL,0,0);int v=(int)SendMessageW((HWND)lp,CB_GETITEMDATA,index,0);
    if(id>=2000&&id<2000+(int)(sizeof fields/sizeof *fields)){
     const Field *f=&fields[id-2000];*(int*)((char*)s_graphics+f->offset)=v;
@@ -361,7 +373,7 @@ int Dkc1WindowsPlatformTest(const char *directory){
   if(!(GetMenuState(s_menu,kDkc1MacMenuScreenRaw+selected,MF_BYCOMMAND)&MF_CHECKED))return 8;
  }
  for(int selected=0;selected<3;selected++){
-  Dkc1MacUpdateMenuState(0,0,1,selected,3,255,0,0,0,0);
+  Dkc1MacUpdateMenuState(0,0,1,selected,3,255,0,0,0,0,0,0);
   for(int i=0;i<3;i++)if(!!(GetMenuState(s_menu,kDkc1MacMenuAspectNative+i,MF_BYCOMMAND)&MF_CHECKED)!=(i==selected))return 9;
  }
  Dkc1WindowsDetach();SDL_DestroyWindow(window);
@@ -374,6 +386,7 @@ int Dkc1MacDisplayLinkWait(unsigned long long a,double b,double*c,double*d,doubl
 void Dkc1MacDisplayLinkStop(void){}
 int Dkc1MacMetalPresenterStart(void*w,double hz,Dkc1MacFullscreenScaling s,int f){(void)w;(void)hz;(void)s;(void)f;return 0;}
 void Dkc1MacMetalPresenterQueueFrame(const uint32_t*p,int w,int h,int width,const Dkc1MacPresentationFrameInfo*i){(void)p;(void)w;(void)h;(void)width;(void)i;}
+void Dkc1MacMetalPresenterQueueHdFrame(const uint32_t*p,int w,int h,int width,int lh,const Dkc1MacPresentationFrameInfo*i){(void)p;(void)w;(void)h;(void)width;(void)lh;(void)i;}
 void Dkc1MacMetalPresenterSetGeometry(int w,int f){(void)w;(void)f;}
 void Dkc1MacMetalPresenterSetScaling(Dkc1MacFullscreenScaling s){(void)s;}
 void Dkc1MacMetalPresenterSetActive(int a){(void)a;}

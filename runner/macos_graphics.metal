@@ -258,3 +258,23 @@ fragment float4 dkc1_compose(VertexOutput in [[stage_in]], texture2d<float> imag
   out_c += noise * (0.5 / 255.0);
   return float4(out_c, 1.0);
 }
+
+// HD texture surface (runner/dkc1_hd.c): the frame is already at 2-4x, so
+// no pixel-art reconstruction applies. Sharp bilinear when magnifying; when
+// minifying, four linear taps spread over each output pixel's footprint.
+// p: source xy, output xy.
+fragment float4 dkc1_hd(VertexOutput in [[stage_in]], texture2d<float> source [[texture(0)]], constant float *u [[buffer(0)]]) {
+  float2 size=float2(u[0],u[1]),ratio=size/float2(u[2],u[3]);
+  if (max(ratio.x,ratio.y)>1.0) {
+    float2 o=ratio*0.25/size;
+    float3 c=source.sample(linearSampler,in.uv+float2(-o.x,-o.y)).rgb+
+             source.sample(linearSampler,in.uv+float2(o.x,-o.y)).rgb+
+             source.sample(linearSampler,in.uv+float2(-o.x,o.y)).rgb+
+             source.sample(linearSampler,in.uv+float2(o.x,o.y)).rgb;
+    return float4(c*0.25,1);
+  }
+  float2 scale=1.0/ratio;
+  float2 texel=in.uv*size-0.5,base=floor(texel),fraction=fract(texel);
+  float2 adjusted=clamp((fraction-(0.5-0.5/scale))*scale,0.0,1.0);
+  return float4(source.sample(linearSampler,(base+adjusted+0.5)/size).rgb,1);
+}

@@ -120,13 +120,16 @@ static char *CopyFileSystemPath(NSString *path) {
   return copy;
 }
 
+/* Raw (.pcm) or compressed (.ogg, tools/msu1_compress.py) track 1. */
 static BOOL HasMsuTrackOne(NSString *directory) {
   NSFileManager *manager = [NSFileManager defaultManager];
-  NSString *track = [directory stringByAppendingPathComponent:@"track-1.pcm"];
-  NSString *legacy =
-      [directory stringByAppendingPathComponent:@"dkc_msu-1.pcm"];
-  return [manager isReadableFileAtPath:track] ||
-         [manager isReadableFileAtPath:legacy];
+  for (NSString *name in @[@"track-1.pcm", @"dkc_msu-1.pcm", @"track-1.ogg",
+                           @"dkc_msu-1.ogg"]) {
+    if ([manager isReadableFileAtPath:
+                     [directory stringByAppendingPathComponent:name]])
+      return YES;
+  }
+  return NO;
 }
 
 static void ShowMsuError(NSString *message) {
@@ -192,7 +195,7 @@ static NSString *ExtractMsuArchive(NSURL *archive) {
   }
   [task release];
   if (!HasMsuTrackOne(destination.path)) {
-    ShowMsuError(@"The archive does not contain track-1.pcm.");
+    ShowMsuError(@"The archive does not contain track 1 (.pcm or .ogg).");
     return nil;
   }
   return destination.path;
@@ -263,6 +266,10 @@ void Dkc1MacInstallMenu(void) {
     [mods addItem:[NSMenuItem separatorItem]];
     AddCommand(mods, @"Choose DKC3 ROM…",
                kDkc1MacMenuChooseBabyKongRom, @"", 0);
+    [mods addItem:[NSMenuItem separatorItem]];
+    AddCommand(mods, @"HD Textures", kDkc1MacMenuToggleHd, @"h",
+               NSEventModifierFlagCommand | NSEventModifierFlagShift);
+    AddCommand(mods, @"Choose HD Pack…", kDkc1MacMenuChooseHdPack, @"", 0);
     AddSubmenu(bar, @"Mods", mods);
 
     NSMenu *music = [[NSMenu alloc] initWithTitle:@"Music"];
@@ -335,7 +342,8 @@ void Dkc1MacUpdateMenuState(int paused, int fullscreen,
                             Dkc1VideoAspect aspect, Dkc1EdgePolicy edge,
                             unsigned char layer_mask, int provenance,
                             int replacement_music, int baby_kong_enabled,
-                            int baby_kong_ready) {
+                            int baby_kong_ready, int hd_enabled,
+                            int hd_ready) {
   if (!s_menu_controller)
     return;
   s_menu_items[kDkc1MacMenuPause].title = paused ? @"Resume" : @"Pause";
@@ -401,6 +409,10 @@ void Dkc1MacUpdateMenuState(int paused, int fullscreen,
       baby_kong_enabled ? NSControlStateValueOn : NSControlStateValueOff;
   s_menu_items[kDkc1MacMenuToggleBabyKong].title =
       baby_kong_ready ? @"Baby Kong" : @"Baby Kong (choose DKC3 ROM…)";
+  s_menu_items[kDkc1MacMenuToggleHd].state =
+      hd_enabled ? NSControlStateValueOn : NSControlStateValueOff;
+  s_menu_items[kDkc1MacMenuToggleHd].title =
+      hd_ready ? @"HD Textures" : @"HD Textures (choose HD pack…)";
 }
 
 int Dkc1MacDisplayLinkStart(void *native_window, double preferred_fps) {
@@ -592,6 +604,70 @@ void Dkc1MacSetBabyKongEnabled(int enabled) {
   }
 }
 
+char *Dkc1MacChooseHdPack(void) {
+  @autoreleasepool {
+    [NSApplication sharedApplication];
+    [NSApp activateIgnoringOtherApps:YES];
+
+    NSOpenPanel *panel = [NSOpenPanel openPanel];
+    panel.title = @"Choose your HD texture pack";
+    panel.message =
+        @"Choose the folder that contains tiles.bin, generated from your own "
+         "ROM with tools/hd_pack.py. The pack is read in place.";
+    panel.prompt = @"Use HD Pack";
+    panel.canChooseDirectories = YES;
+    panel.canChooseFiles = NO;
+    panel.allowsMultipleSelection = NO;
+    if ([panel runModal] != NSModalResponseOK)
+      return NULL;
+    return CopyFileSystemPath(panel.URL.path);
+  }
+}
+
+char *Dkc1MacSavedHdPack(void) {
+  @autoreleasepool {
+    NSString *path = [[NSUserDefaults standardUserDefaults]
+        stringForKey:@"DKC1HdPack"];
+    if (!path.length || ![[NSFileManager defaultManager]
+                            isReadableFileAtPath:
+                                [path stringByAppendingPathComponent:
+                                          @"tiles.bin"]])
+      return NULL;
+    return CopyFileSystemPath(path);
+  }
+}
+
+void Dkc1MacSetHdPack(const char *path) {
+  @autoreleasepool {
+    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+    if (path && *path) {
+      NSString *value = [NSString stringWithUTF8String:path];
+      if (value)
+        [defaults setObject:value forKey:@"DKC1HdPack"];
+    } else {
+      [defaults removeObjectForKey:@"DKC1HdPack"];
+    }
+    [defaults synchronize];
+  }
+}
+
+int Dkc1MacSavedHdEnabled(void) {
+  @autoreleasepool {
+    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+    if (![defaults objectForKey:@"DKC1HdEnabled"])
+      return 1;
+    return [defaults boolForKey:@"DKC1HdEnabled"] ? 1 : 0;
+  }
+}
+
+void Dkc1MacSetHdEnabled(int enabled) {
+  @autoreleasepool {
+    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+    [defaults setBool:enabled != 0 forKey:@"DKC1HdEnabled"];
+    [defaults synchronize];
+  }
+}
+
 char *Dkc1MacSavedMsu1(void) {
   @autoreleasepool {
     NSString *path = [[NSUserDefaults standardUserDefaults]
@@ -627,7 +703,7 @@ char *Dkc1MacChooseMsu1(void) {
     NSString *directory = nil;
     if (isDirectory.boolValue) {
       if (!HasMsuTrackOne(selection.path)) {
-        ShowMsuError(@"The selected folder does not contain track-1.pcm.");
+        ShowMsuError(@"The selected folder does not contain track 1 (.pcm or .ogg).");
         return NULL;
       }
       directory = selection.path;

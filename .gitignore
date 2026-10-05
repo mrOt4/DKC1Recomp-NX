@@ -13,6 +13,9 @@ tier2_dkc1_*.json
 tier2_dkc1_*.jsonl
 *.ppm
 *.pcm
+# Compressed MSU-1 music packs (tools/msu1_compress.py) are third-party content.
+*.ogg
+*.msu1
 *.szst*
 captures/
 artifacts/

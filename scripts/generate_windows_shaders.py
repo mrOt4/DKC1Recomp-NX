@@ -12,7 +12,7 @@ def translate(source):
     source=source[source.index('fragment float4 dkc1_flat'):]
     signature=r'fragment float4 (dkc1_\w+)\([^\n]+\) \{'
     names=re.findall(signature,source)
-    if names != ['dkc1_flat','dkc1_reconstruct','dkc1_lines','dkc1_beam','dkc1_down','dkc1_blur','dkc1_compose']:
+    if names != ['dkc1_flat','dkc1_reconstruct','dkc1_lines','dkc1_beam','dkc1_down','dkc1_blur','dkc1_compose','dkc1_hd']:
         raise ValueError('Metal pass contract changed')
     source=re.sub(signature,r'vec4 \1() {',source)
     source=re.sub(r'texture2d<float>', 'sampler2D',source)

@@ -4,7 +4,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-enum { Flat, Reconstruct, Lines, Beam, Down, Blur, Compose, PassCount };
+enum { Flat, Reconstruct, Lines, Beam, Down, Blur, Compose, Hd, PassCount };
 @implementation Dkc1MetalGraphics {
   id<MTLDevice> _device;
   id<MTLRenderPipelineState> _pipelines[PassCount];
@@ -32,14 +32,14 @@ enum { Flat, Reconstruct, Lines, Beam, Down, Blur, Compose, PassCount };
   id<MTLLibrary> library=[device newLibraryWithSource:source options:options error:error];
   if (!library) { [self release]; return nil; }
   id<MTLFunction> vertex=[library newFunctionWithName:@"dkc1_vertex"];
-  NSArray *names=@[@"flat",@"reconstruct",@"lines",@"beam",@"down",@"blur",@"compose"];
+  NSArray *names=@[@"flat",@"reconstruct",@"lines",@"beam",@"down",@"blur",@"compose",@"hd"];
   BOOL ok=YES;
   for (int i=0;i<PassCount;i++) {
     id<MTLFunction> fragment=[library newFunctionWithName:
         [@"dkc1_" stringByAppendingString:names[i]]];
     MTLRenderPipelineDescriptor *d=[[MTLRenderPipelineDescriptor alloc] init];
     d.vertexFunction=vertex; d.fragmentFunction=fragment;
-    d.colorAttachments[0].pixelFormat=(i==Flat || i==Reconstruct || i==Compose)
+    d.colorAttachments[0].pixelFormat=(i==Flat || i==Reconstruct || i==Compose || i==Hd)
         ? MTLPixelFormatBGRA8Unorm : MTLPixelFormatRGBA16Float;
     _pipelines[i]=[device newRenderPipelineStateWithDescriptor:d error:error];
     [d release]; [fragment release];
@@ -179,6 +179,35 @@ enum { Flat, Reconstruct, Lines, Beam, Down, Blur, Compose, PassCount };
     float copy[27]={target.width,target.height,finalViewport.width,finalViewport.height,0};
     [self pass:Flat source:target target:finalTarget viewport:finalViewport parameters:copy buffer:buffer];
   }
+  return YES;
+}
+/* HD texture surface (runner/dkc1_hd.c). Already upscaled, so it bypasses
+ * Reconstruct/CRT and the effect cache; input slots are shared with the
+ * native path and recycled when the GPU finishes reading them. */
+- (BOOL)encodeHdPixels:(const uint32_t *)pixels width:(int)w height:(int)h
+                target:(id<MTLTexture>)target viewport:(MTLViewport)v
+         commandBuffer:(id<MTLCommandBuffer>)buffer {
+  if (!pixels || w<1 || h<1 || !target || !buffer) return NO;
+  _cacheValid=NO;
+  int slot=-1; [_inputLock lock];
+  for (int i=0;i<3;i++) if (!_busy[i]) { slot=i; _busy[i]=YES; break; }
+  [_inputLock unlock];
+  if (slot<0) return NO;
+  if (!_inputs[slot] || _inputs[slot].width!=(NSUInteger)w || _inputs[slot].height!=(NSUInteger)h) {
+    [_inputs[slot] release];
+    _inputs[slot]=[self texture:w height:h format:MTLPixelFormatBGRA8Unorm shared:YES];
+  }
+  if (!_inputs[slot]) {
+    [_inputLock lock]; _busy[slot]=NO; [_inputLock unlock]; return NO;
+  }
+  [_inputs[slot] replaceRegion:MTLRegionMake2D(0,0,w,h) mipmapLevel:0
+      withBytes:pixels bytesPerRow:(NSUInteger)w*4];
+  [buffer addCompletedHandler:^(id<MTLCommandBuffer> completed) {
+    (void)completed;
+    [_inputLock lock]; _busy[slot]=NO; [_inputLock unlock];
+  }];
+  float p[27]={w,h,v.width,v.height};
+  [self pass:Hd source:_inputs[slot] target:target viewport:v parameters:p buffer:buffer];
   return YES;
 }
 - (void)dealloc {

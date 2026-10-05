@@ -48,6 +48,8 @@ enum Dkc1MacMenuCommand {
   kDkc1MacMenuScreenCrt,
   kDkc1MacMenuScreenComposite,
   kDkc1MacMenuScreenTrinitron,
+  kDkc1MacMenuToggleHd,
+  kDkc1MacMenuChooseHdPack,
   kDkc1MacMenuCommandCount
 };
 
@@ -60,6 +62,14 @@ char *Dkc1MacSavedBabyKongRom(void);
 void Dkc1MacSetBabyKongRom(const char *path);
 int Dkc1MacSavedBabyKongEnabled(void);
 void Dkc1MacSetBabyKongEnabled(int enabled);
+
+/* HD texture pack: a user-generated directory holding tiles.bin
+ * (tools/hd_pack.py). Only the path is stored, never the pack. */
+char *Dkc1MacChooseHdPack(void);
+char *Dkc1MacSavedHdPack(void);
+void Dkc1MacSetHdPack(const char *path);
+int Dkc1MacSavedHdEnabled(void);
+void Dkc1MacSetHdEnabled(int enabled);
 
 /* Selects an extracted MSU-1 directory or extracts a .msu1 archive into the
  * app's Application Support directory, saves the selection, and returns a
@@ -87,7 +97,8 @@ void Dkc1MacUpdateMenuState(int paused, int fullscreen,
                             Dkc1VideoAspect aspect, Dkc1EdgePolicy edge,
                             unsigned char layer_mask, int provenance,
                             int replacement_music, int baby_kong_enabled,
-                            int baby_kong_ready);
+                            int baby_kong_ready, int hd_enabled,
+                            int hd_ready);
 void Dkc1MacMenuCommand(int command);
 
 /* Runs a display-linked cadence source on a private run loop. The SDL host

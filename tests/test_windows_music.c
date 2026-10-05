@@ -10,6 +10,7 @@ int main(int argc,char **argv){
  CHECK(argc==2);char archive[4096],error[256];snprintf(archive,sizeof archive,"%s/synthetic.zip",argv[1]);
  CHECK(Dkc1WindowsMusicTrackName("../../track-1.pcm")==1); /* safe flattened basename */
  CHECK(Dkc1WindowsMusicTrackName("track-1.pcm.exe")==0);CHECK(Dkc1WindowsMusicTrackName("track-33.pcm")==0);
+ CHECK(Dkc1WindowsMusicTrackName("dkc_msu-7.ogg")==7);CHECK(Dkc1WindowsMusicTrackName("track-1.ogg.exe")==0);
  unsigned char pcm[8+441*4]={'M','S','U','1',0,0,0,0};for(size_t i=8;i<sizeof pcm;i+=2){pcm[i]=0x40;pcm[i+1]=0x20;}
  mz_zip_archive zip={0};CHECK(mz_zip_writer_init_file(&zip,archive,0));
  CHECK(mz_zip_writer_add_mem(&zip,"../../track-1.pcm",pcm,sizeof pcm,MZ_BEST_SPEED));

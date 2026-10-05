@@ -231,7 +231,11 @@ int Dkc1MacPauseMenuIsOpen(void) { return s_open; }
   [self heading:@"Baby Kong" view:view y:&y];
   [self button:@"Enable / Disable Baby Kong" tag:kDkc1MacMenuToggleBabyKong view:view y:&y];
   [self button:@"Choose DKC3 Sprite Source…" tag:kDkc1MacMenuChooseBabyKongRom view:view y:&y];
-  [self text:@"The Baby Kong character replacement uses your local DKC3 ROM. Existing character settings are shared with the Mods menu." view:view y:&y height:60];[self finish:view y:y];
+  [self text:@"The Baby Kong character replacement uses your local DKC3 ROM. Existing character settings are shared with the Mods menu." view:view y:&y height:60];
+  [self heading:@"HD Textures" view:view y:&y];
+  [self button:@"Enable / Disable HD Textures" tag:kDkc1MacMenuToggleHd view:view y:&y];
+  [self button:@"Choose HD Pack…" tag:kDkc1MacMenuChooseHdPack view:view y:&y];
+  [self text:@"Packs are generated from your own ROM with tools/hd_pack.py and never ship with the app. HD applies in 16:9 and 16:10; 4:3 stays original." view:view y:&y height:60];[self finish:view y:y];
   view=[self page:@"Credits"];y=16;
   [self heading:@"Donkey Kong Country — Native Recompilation" view:view y:&y];
   [self text:@"Original game by Rare and Nintendo. Native recompilation uses snesrecomp. Graphics and CRT models are adapted from DKC2Recomp; color profiles use the shared engine’s screen-color models.\n\nThis app uses your own game data. Third-party source notices are retained with the project." view:view y:&y height:150];[self finish:view y:y];
