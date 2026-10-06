@@ -17,6 +17,7 @@ enum {
   kItemLoad,
   kItemRewind,
   kItemMsu1,
+  kItemAspect,
   kItemHd,
   kItemCheatLives,
   kItemCheatCodes,
@@ -31,13 +32,16 @@ static int s_cursor;
 void Dkc1MenuDefaults(Dkc1MenuSettings *settings) {
   memset(settings, 0, sizeof *settings);
   settings->msu1 = true;
+  settings->widescreen = true;
   settings->hd = true;
+  settings->perf = false;
 }
 
 static bool *Toggle(Dkc1MenuSettings *settings, int item) {
   switch (item) {
     case kItemRewind: return &settings->rewind;
     case kItemMsu1: return &settings->msu1;
+    case kItemAspect: return &settings->widescreen;
     case kItemHd: return &settings->hd;
     case kItemCheatLives: return &settings->cheat_lives;
     case kItemCheatCodes: return &settings->cheat_codes;
@@ -52,6 +56,7 @@ static const struct {
 } kKeys[] = {
   {"rewind", offsetof(Dkc1MenuSettings, rewind)},
   {"msu1", offsetof(Dkc1MenuSettings, msu1)},
+  {"widescreen", offsetof(Dkc1MenuSettings, widescreen)},
   {"hd", offsetof(Dkc1MenuSettings, hd)},
   {"cheat_lives", offsetof(Dkc1MenuSettings, cheat_lives)},
   {"cheat_codes", offsetof(Dkc1MenuSettings, cheat_codes)},
@@ -122,7 +127,14 @@ Dkc1MenuAction Dkc1MenuUpdate(Dkc1MenuSettings *settings, uint32_t pressed) {
   }
   bool *toggle = Toggle(settings, s_cursor);
   if (toggle && (step || (pressed & kDkc1GamepadA))) {
+    /* HD only exists in 16:9. */
+    if (s_cursor == kItemHd && (!settings->widescreen ||
+                                !settings->hd_available))
+      return kDkc1MenuActionNone;
     *toggle = !*toggle;
+    /* 4:3 turns HD off; back in 16:9 a loaded pack comes back on. */
+    if (s_cursor == kItemAspect)
+      settings->hd = settings->widescreen && settings->hd_available;
     return kDkc1MenuActionChanged;
   }
   if (!(pressed & kDkc1GamepadA))
@@ -202,6 +214,7 @@ void Dkc1MenuDraw(const Dkc1MenuSettings *settings, uint32_t *pixels,
     "Cargar estado",
     "Rebobinar L / Avanzar R",
     "Musica MSU-1 (reiniciar)",
+    "Pantalla",
     "Texturas HD",
     "Truco: vidas infinitas",
     "Codigos (cheats.txt)",
@@ -225,7 +238,13 @@ void Dkc1MenuDraw(const Dkc1MenuSettings *settings, uint32_t *pixels,
                      color);
     char value[16] = "";
     const bool *toggle = Toggle((Dkc1MenuSettings *)settings, i);
-    if (toggle)
+    if (i == kItemAspect)
+      snprintf(value, sizeof value, "< %s >",
+               settings->widescreen ? "16:9" : "4:3");
+    else if (i == kItemHd &&
+             (!settings->widescreen || !settings->hd_available))
+      snprintf(value, sizeof value, "--");
+    else if (toggle)
       snprintf(value, sizeof value, "%s", *toggle ? "SI" : "NO");
     else if (i == kItemSlot)
       snprintf(value, sizeof value, "< %d >", settings->slot + 1);

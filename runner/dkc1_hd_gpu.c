@@ -627,6 +627,15 @@ void Dkc1HdGpuPresentOverlay(const uint32_t *pixels, int w, int h,
   glDisable(HD_GL_BLEND);
 }
 
+void Dkc1HdGpuClearScreen(unsigned framebuffer, int width, int height) {
+  if (!s_ready)
+    return;
+  glBindFramebuffer(HD_GL_FRAMEBUFFER, framebuffer);
+  glViewport(0, 0, width, height);
+  glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+  glClear(HD_GL_COLOR_BUFFER_BIT);
+}
+
 void Dkc1HdGpuFinish(void) {
   if (s_ready)
     glFinish();

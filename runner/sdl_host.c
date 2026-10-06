@@ -1110,6 +1110,10 @@ static void ApplyPresentationGeometry(void) {
 }
 
 static void ApplyWindowedSize(void) {
+#ifdef __SWITCH__
+  /* The console's mode sets the size (720p handheld, 1080p docked). */
+  return;
+#endif
   SDL_SetWindowSize(s_window, PresentationWidth() * s_graphics.window_scale,
                     kDkc1VideoHeight * s_graphics.window_scale);
 }
@@ -1437,6 +1441,9 @@ static void SwitchGlPresent(void) {
     vw = (int)((int64_t)oh * pw / kDkc1VideoHeight);
   }
   const int vx = (ow - vw) / 2, vy = (oh - vh) / 2;
+  /* The swap chain keeps whatever the bars around the picture last held
+   * (16:9 frames after switching to 4:3): clear the whole surface. */
+  Dkc1HdGpuClearScreen(0, ow, oh);
   const Dkc1HdGpuInputs *gpu = Dkc1HdGpuFrame();
   int hd_width, hd_height;
   const uint32_t *hd;
@@ -2330,8 +2337,18 @@ static void SwitchMenuApply(void) {
     Dkc1SwitchClockBoost(true);
     s_boosted = true;
   }
+  /* 16:9 or 4:3; HD only in 16:9 (the menu keeps hd in step). */
+  s_menu.hd_available = Dkc1HdReady();
+  const Dkc1VideoAspect aspect =
+      s_menu.widescreen ? kDkc1VideoAspect16x9 : kDkc1VideoAspectNative;
+  if (Dkc1VideoGetAspect() != aspect) {
+    if (s_window)
+      SetAspectMode(aspect);
+    else
+      Dkc1VideoSetAspect(aspect);  /* at boot: InitVideo sizes from it */
+  }
   if (Dkc1HdReady())
-    Dkc1HdSetEnabled(s_menu.hd);
+    Dkc1HdSetEnabled(s_menu.hd && s_menu.widescreen);
   s_controls.assist_enabled = s_menu.rewind;
   s_controls.assist_pads[0] =
       DKC1_PAD_BUTTON(SDL_CONTROLLER_BUTTON_LEFTSHOULDER);   /* rewind */

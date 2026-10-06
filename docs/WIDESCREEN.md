@@ -104,6 +104,15 @@ expected source shape changes, and are tested for idempotence. They are gated
 by `Dkc1VideoTerrainReady()`, so fixed screens and unsupported layouts retain
 the stock visibility rules.
 
+## Fixed screens
+
+Logos, the intro, the title, file select and the maps draw on 32-column
+tilemaps with no horizontal scroll: nothing authored exists beside their
+256 columns (any column past them would be the hardware wrap repeating the
+picture). They stay centered with black side bars. A mirrored, blurred
+fill of the bars was tried and dropped: on the console it read as a
+duplicate of the picture.
+
 ## What was intentionally not ported
 
 The SuperZSNES ROM hack moved DKC1's logical camera bounds inward to reveal

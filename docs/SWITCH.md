@@ -55,10 +55,11 @@ saved to `sdmc:/switch/dkc1/menu.cfg`.
 | Guardar / Cargar estado | Save or load that slot (loading closes the menu) |
 | Rebobinar L / Avanzar R | Hold L to rewind (snapshot every 3 frames, up to 128 MiB), R for 3x speed |
 | Música MSU-1 | Use the pack in `msu1/`; takes effect at the next launch |
-| Texturas HD | HD pack on or off (16:9/16:10 only) |
+| Pantalla 16:9 / 4:3 | Aspect. 4:3 turns HD off; back to 16:9, HD comes back on if a pack is loaded |
+| Texturas HD | HD pack on or off (16:9 only; shows `--` in 4:3 or without a pack) |
 | Vidas infinitas | Lives (`$7E0575`) never drop below 5 |
 | Códigos (cheats.txt) | Pro Action Replay codes from `sdmc:/switch/dkc1/cheats.txt` |
-| Rendimiento en pantalla | Frame-time HUD (see below) |
+| Rendimiento en pantalla | Frame-time HUD (see below; off by default) |
 | Salir del juego | Save SRAM and quit |
 
 `cheats.txt` holds one 8-digit Pro Action Replay code per line

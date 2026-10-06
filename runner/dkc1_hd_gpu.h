@@ -25,6 +25,9 @@ void Dkc1HdGpuPresentNative(const uint32_t *pixels, int width, int height,
 void Dkc1HdGpuPresentOverlay(const uint32_t *pixels, int width, int height,
                              size_t pitch_pixels, unsigned framebuffer, int x,
                              int y, int view_width, int view_height);
+/* Clear the whole framebuffer to black: what a narrower picture (4:3, a
+ * resized viewport) leaves around itself must not keep older frames. */
+void Dkc1HdGpuClearScreen(unsigned framebuffer, int width, int height);
 /* Wait for the GPU to finish all submitted work (timing diagnostics). */
 void Dkc1HdGpuFinish(void);
 /* Read the last composed frame back as 0x00RRGGBB rows (verification). */

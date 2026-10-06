@@ -13,10 +13,12 @@ typedef struct Dkc1MenuSettings {
   int slot;            /* save-state slot, 0..4 */
   bool rewind;         /* hold L to rewind, R to fast-forward */
   bool msu1;           /* replacement music (applies on restart) */
-  bool hd;             /* HD textures */
+  bool widescreen;     /* 16:9, else 4:3 (4:3 turns HD off) */
+  bool hd;             /* HD textures (16:9 only) */
   bool cheat_lives;    /* lives never drop below 5 */
   bool cheat_codes;    /* Pro Action Replay codes from cheats.txt */
   bool perf;           /* frame-time overlay and periodic log */
+  bool hd_available;   /* set by the host, not saved: an HD pack loaded */
 } Dkc1MenuSettings;
 
 typedef enum Dkc1MenuAction {
