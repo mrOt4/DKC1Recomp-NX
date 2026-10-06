@@ -1,10 +1,5 @@
-# AI Usage Disclosure from Soul
-Yes, I used AI.
-No, I don't care about your opinion
-This was to simply port a game I love to Switch without spending a week.
 
 # DKC1Recomp-NX 1.0.1
-
 This fork adds, on top of DKC1Recomp and its Switch port:
 
 - **Nintendo Switch at 60 fps**: own audren audio output, fixed 60 Hz frame
