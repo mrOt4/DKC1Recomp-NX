@@ -2074,6 +2074,33 @@ static bool Dkc1DebugForceWidescreenFallback(void) {
          requested == snes_frame_counter;
 }
 
+/* DKC1 draws its counters (banana counter, lives counter) into the first
+ * OAM slots, ahead of every object, and only while one is shown; the same
+ * slots hold ordinary objects otherwise. Count that leading run of HUD
+ * sprites by their tiles: the spinning banana (names $1E0-$1EF, palette 0),
+ * the digits ($60-$7F, palette 0) and the Kong heads ($E0-$E3 DK, $1C0-$1C3
+ * Diddy, palette 1), all in the top band. The run ends at the first other
+ * sprite. Measured on the jungle and death routes. */
+static int Dkc1HudOamPrefix(const Ppu *ppu) {
+  int count = 0;
+  for (; count < 16; count++) {
+    const uint16_t pos = ppu->oam[count * 2];
+    const uint16_t data = ppu->oam[count * 2 + 1];
+    const unsigned y = pos >> 8;
+    const unsigned name = (data & 0xff) | ((data >> 8) & 1u) << 8;
+    const unsigned attr = (data >> 8) & 0xfe;  /* priority, palette, flips */
+    if (y >= 48)
+      break;
+    const bool banana = attr == 0x30 && name >= 0x1e0 && name <= 0x1ef;
+    const bool digit = attr == 0x30 && name >= 0x60 && name <= 0x7f;
+    const bool head = attr == 0x32 && ((name >= 0xe0 && name <= 0xe3) ||
+                                       (name >= 0x1c0 && name <= 0x1c3));
+    if (!banana && !digit && !head)
+      break;
+  }
+  return count;
+}
+
 void Dkc1DrawPpuFrame(void) {
   /* Aspect changes are presentation-only, but retained shadow coordinates
    * are sized around the active side extent. A 16:9 <-> 16:10 switch must
@@ -2248,6 +2275,15 @@ void Dkc1DrawPpuFrame(void) {
     PpuSetWidescreenPresentationXBias(g_ppu, 0);
   }
 
+  /* Widescreen gameplay: anchor the counters to the screen edges, the
+   * banana counter (left half) to the left edge and the lives counter
+   * (right half) to the right, instead of leaving them inside the
+   * centered 256 columns. Presentation only: the OAM itself is unchanged. */
+  {
+    const int hud = extend_world ? Dkc1HudOamPrefix(g_ppu) : 0;
+    PpuSetWsHudOamBand(g_ppu, hud ? 48 : 0, 128, 129);
+    PpuSetWsHudOamShiftRange(g_ppu, 0, (uint8_t)hud);
+  }
   Dkc1HdPrepareFrame(g_ppu);
   Dkc1BabyKongPrepareFrame(g_ppu, g_ram, presentation_bias);
 

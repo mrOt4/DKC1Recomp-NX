@@ -201,6 +201,7 @@ if(WIN32)
         runner/desktop_rewind.c runner/desktop_input.c runner/desktop_refresh.c
         runner/desktop_crt.c runner/desktop_filter.c runner/desktop_graphics.c
         runner/windows_platform.c runner/windows_graphics.c runner/windows_music_pack.c
+        runner/dkc1_hd_gpu.c
         ${CMAKE_CURRENT_BINARY_DIR}/windows_shaders.h)
     target_include_directories(dkc1_windows PRIVATE runner recomp
         ${SNESRECOMP_RUNNER_INCLUDE_DIRS} ${CMAKE_CURRENT_BINARY_DIR})
@@ -228,8 +229,10 @@ if(WIN32)
     add_executable(test_windows_music tests/test_windows_music.c
         runner/windows_music_pack.c runner/dkc1_msu1.c runner/dkc1_stb_vorbis.c)
     target_include_directories(test_windows_music PRIVATE runner)
-    target_compile_definitions(test_windows_music PRIVATE _CRT_SECURE_NO_WARNINGS)
-    target_link_libraries(test_windows_music PRIVATE miniz ole32)
+    target_compile_definitions(test_windows_music PRIVATE _CRT_SECURE_NO_WARNINGS
+        SDL_MAIN_HANDLED)
+    # dkc1_msu1.c decodes compressed tracks on an SDL thread.
+    target_link_libraries(test_windows_music PRIVATE miniz ole32 SDL2::SDL2)
     file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/music-test)
     add_test(NAME windows_music COMMAND test_windows_music ${CMAKE_CURRENT_BINARY_DIR}/music-test)
     add_test(NAME windows_platform COMMAND dkc1_windows --platform-test ${CMAKE_CURRENT_BINARY_DIR}/music-test)

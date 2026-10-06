@@ -92,6 +92,47 @@ partir de su propia ROM.
 - Pendiente: los caracteres que solo aparecen en la pantalla secundaria o
   con brillo < 15 no se vuelcan; volcar el resto de niveles.
 
+### Pack v2 y compositor para Switch (2026-10-06)
+
+Problemas medidos en Switch con el pack v1:
+
+1. **Logos de Nintendo y Rare destrozados.** Cada tile HD del logo era de un
+   solo índice: el más bajo de los que usa el tile. El volcado se quedaba con
+   la primera aparición de cada carácter cuando las puntuaciones empataban, y
+   el logo entra con un fundido que escribe la CGRAM. Esa primera aparición
+   tenía la paleta en negro y la cuantización desempataba al primer índice.
+   Ahora la puntuación suma los colores distintos que muestran los índices
+   del carácter (y su luminancia como desempate). Los registros del logo
+   pasan a 14–16 colores distintos.
+2. **Aspecto granulado.** La cuantización a los 16 colores con tramado Bayer
+   y la mezcla del 35 % de grano nativo (`--detail 0.35`, bloques de 4×4)
+   pixelaban la imagen.
+3. **GPU de 15 a 28 ms por frame** (con `glFinish`, `gpu.flag`) y captura +
+   codificación de 4 a 9 ms en el hilo principal: no llegaba a 60 fps. El
+   shader hacía divisiones y módulos enteros (emulados en Maxwell), leía dos
+   texels de 128 bits y la imagen nativa, y añadía dos pases completos de
+   *deblocking*.
+
+Rediseño:
+
+- **Formato v2** (`DKC1HDP2`, 2 bytes por texel): índices `i`, `j` (4 bits
+  cada uno, 0 = transparente) y peso `w`. El color es el de `i` mezclado
+  hacia el de `j`, donde 0 equivale a lo que hay debajo. `hd_pack.py` ajusta
+  cada píxel del modelo a la mejor pareja de colores de la paleta y, con
+  cobertura parcial, a un color mezclado con lo de debajo.
+- **Composición** (CPU y GPU con la misma aritmética en coma flotante,
+  `FinishColor`): con pesos 0/255 coincide con el PPU. El pack de identidad
+  da 0 píxeles distintos frente al frame nativo; GPU frente a CPU, 0
+  píxeles con diferencia mayor que 1 en 840 frames (Wine, GL 3.3).
+- **GPU**: una sola textura RGBA32UI de entrada (16 bytes por píxel; los
+  píxeles nativos llevan su color dentro y ya no se sube la imagen nativa),
+  atlas RG8 de 256 tiles por fila, escala potencia de 2 (solo
+  desplazamientos), un único pase de composición y tres juegos de texturas
+  de entrada en rotación. Sin *deblocking*.
+- **Escalas**: `tiles-2x.bin` se genera promediando el resultado 4× del
+  modelo. Antes, la Switch reducía el pack 4× al cargar tomando un texel de
+  cada cuatro.
+
 Objetivo: sustituir la imagen de tiles, sprites y fondos por versiones en alta
 resolución **solo en la presentación**. La CPU recompilada, la WRAM, la VRAM,
 la CGRAM, la OAM, la colisión, la física y los guardados no cambian, y el

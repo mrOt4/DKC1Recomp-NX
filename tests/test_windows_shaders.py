@@ -7,7 +7,7 @@ module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
 class WindowsShaderContracts(unittest.TestCase):
     def test_all_mac_passes_are_translated(self):
         shaders=module.translate((ROOT/'runner/macos_graphics.metal').read_text())
-        self.assertEqual(len(shaders),7)
+        self.assertEqual(len(shaders),8)  # 7 CRT passes + dkc1_hd
         for shader in shaders:
             self.assertNotIn('[[',shader)
             self.assertNotIn('texture2d<',shader)

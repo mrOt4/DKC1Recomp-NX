@@ -73,6 +73,32 @@ const char *Dkc1HdStatus(void);
 void Dkc1HdPrepareFrame(Ppu *ppu);
 void Dkc1HdFinishFrame(Ppu *ppu, int width);
 
+/* GPU composition (dkc1_hd_gpu.c). A host that can compose on the GPU
+ * enables it; pack frames are then encoded for the shader instead of being
+ * composed on the CPU, and Dkc1HdOutput returns NULL. DKC1_HD_GPU_VERIFY=1
+ * also keeps the CPU composition so the two can be compared. */
+enum {
+  kDkc1HdGpuNoTile = 0x1ffff,
+  kDkc1HdGpuLineStride = 258,  /* CGRAM[256], fixed colour, brightness */
+  kDkc1HdGpuModeCompose = 0,
+  kDkc1HdGpuModeNative = 1,
+  kDkc1HdGpuModeMagenta = 2,
+};
+
+typedef struct Dkc1HdGpuInputs {
+  int width, height, scale;  /* scale: 1, 2 or 4 */
+  const uint32_t *g;         /* width * height RGBA32UI texels (dkc1_hd.c) */
+  const uint16_t *lines;     /* height * kDkc1HdGpuLineStride */
+  const uint16_t *tiles;     /* tile_count tiles of (8*scale)^2 texels */
+  uint32_t tile_count;
+  uint64_t tiles_generation; /* re-upload the atlas when this changes */
+} Dkc1HdGpuInputs;
+
+void Dkc1HdSetGpuComposition(bool enabled);
+bool Dkc1HdGpuComposition(void);
+/* Inputs for the current frame, or NULL when nothing is to be composed. */
+const Dkc1HdGpuInputs *Dkc1HdGpuFrame(void);
+
 /* Latest recomposed frame, 0x00RRGGBB, or NULL when disabled. */
 const uint32_t *Dkc1HdOutput(int *width, int *height, size_t *pitch_pixels);
 void Dkc1HdGetStats(Dkc1HdStats *stats);

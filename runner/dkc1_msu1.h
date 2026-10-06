@@ -1,6 +1,7 @@
 #ifndef DKC1_MSU1_H
 #define DKC1_MSU1_H
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -25,9 +26,15 @@ void Dkc1Msu1ObserveMusicState(Dkc1Msu1 *player, uint16_t requested_theme,
                                uint16_t start_state);
 void Dkc1Msu1Reset(Dkc1Msu1 *player);
 
-/* Mixes 44.1-kHz signed stereo MSU PCM into the stock SPC output. */
+/* Mixes the current track (44.1-kHz PCM, or Vorbis at its own rate)
+ * into the stock SPC output, resampled to `output_rate` with a windowed-
+ * sinc filter. Never blocks: Vorbis frames come from a decode thread, and
+ * a track whose first frames are not decoded yet starts a little later. */
 void Dkc1Msu1Mix(Dkc1Msu1 *player, int16_t *samples, int frames,
                   int channels, int output_rate);
+/* Tools and tests only: wait (up to timeout_ms) until the track that the
+ * last ObserveMusicState started has decoded frames ready. */
+bool Dkc1Msu1WaitReady(Dkc1Msu1 *player, int timeout_ms);
 
 unsigned Dkc1Msu1CurrentTrack(const Dkc1Msu1 *player);
 const char *Dkc1Msu1Directory(const Dkc1Msu1 *player);

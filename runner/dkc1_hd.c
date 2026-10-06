@@ -2,7 +2,11 @@
 
 #include "dkc1_video.h"
 #include "snes/ppu.h"
+#ifdef __SWITCH__
+#include "switch_clock.h"
+#endif
 
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -40,30 +44,54 @@ static size_t s_out_capacity;
 
 static Dkc1HdStats s_stats;
 static bool s_debug_misses;  /* DKC1_HD_DEBUG=misses: tint pack misses */
-static bool s_deblock = true;  /* DKC1_HD_DEBLOCK=0 disables */
+/* Track the layers under/over each pixel so HD silhouettes can differ from
+ * the native ones. DKC1_HD_SHAPE=0 keeps native silhouettes (cheaper). */
+static bool s_shape = true;
 
-/* ---- HD pack (tiles.bin, written by tools/hd_pack.py) --------------------
- *   0  "DKC1HDP1"   8  u32 version (1)   12 u32 scale   16 u32 count
+/* ---- HD pack (tiles.bin / tiles-<s>x.bin, written by tools/hd_pack.py) ---
+ *   0  "DKC1HDP2"   8  u32 version (2)   12 u32 scale   16 u32 count
  *  20  u32 reserved 24 u8 rom_sha256[32] 56 u8 reserved[8]
  *  64  count x { u64 key, u32 data offset, u32 flags }, sorted by key
- *  ... tile data: (8*scale)^2 bytes each, palette-relative indices in the
- *      stored character's orientation, 0 = transparent. */
+ *  ... tile data: (8*scale)^2 texels of 2 bytes each, in the stored
+ *      character's orientation: byte 0 = i << 4 | j, two palette-relative
+ *      indices (0 = transparent), byte 1 = w, the weight of j (0-255). A
+ *      texel's color is i's blended toward j's by w/255, so HD edges and
+ *      gradients fall between palette colors without leaving the palette
+ *      (fades and palette animation still apply). As a little-endian u16:
+ *      (i << 4 | j) | w << 8. */
 typedef struct HdPack {
   uint8_t *blob;
   size_t size;
-  uint32_t scale;
+  uint32_t scale;      /* scale of `tiles` (possibly reduced at load) */
   uint32_t count;
+  uint16_t *tiles;     /* count tiles of (8*scale)^2 texels, index order */
+  uint64_t *keys;      /* count sorted character keys (PackFind) */
+  uint64_t generation; /* changes whenever `tiles` changes (GPU upload) */
   char path[512];
 } HdPack;
 
 static HdPack s_pack;
 
 typedef struct HdCharSlot {
-  uint64_t stamp;   /* frame the key below was computed for */
+  uint64_t stamp;   /* frame the fields below were computed for */
   uint64_t key;
-  const uint8_t *tile;  /* pack tile, NULL when the pack lacks it */
-  uint64_t dump_stamp;  /* frame this character's occurrence was scored */
+  int32_t tile_index;   /* index in s_pack.tiles, -1 when the pack lacks it */
+  uint64_t dump_stamp[2];  /* frame a main / sub occurrence was scored */
 } HdCharSlot;
+
+/* GPU-encode workers resolve slots concurrently. A slot's fields are
+ * published by its stamp (release store after them, acquire load before
+ * reading them); workers racing on one slot store identical values. MSVC
+ * volatile has these semantics on x86/x64. */
+#if defined(_MSC_VER) && !defined(__clang__)
+#define HD_LOAD_ACQUIRE(p) (*(volatile const uint64_t *)(p))
+#define HD_STORE_RELEASE(p, v) (*(volatile uint64_t *)(p) = (v))
+#define HD_STORE_RELAXED(p, v) (*(p) = (v))
+#else
+#define HD_LOAD_ACQUIRE(p) __atomic_load_n((p), __ATOMIC_ACQUIRE)
+#define HD_STORE_RELEASE(p, v) __atomic_store_n((p), (v), __ATOMIC_RELEASE)
+#define HD_STORE_RELAXED(p, v) __atomic_store_n((p), (v), __ATOMIC_RELAXED)
+#endif
 
 static HdCharSlot s_chars[kHdCharSlots];
 
@@ -111,46 +139,90 @@ static uint32_t ReadU32(const uint8_t *p) {
          (uint32_t)p[3] << 24;
 }
 
+static uint64_t s_pack_generation;
+
 static void UnloadPack(void) {
   free(s_pack.blob);
+  free(s_pack.tiles);
+  free(s_pack.keys);
   memset(&s_pack, 0, sizeof s_pack);
+  s_pack.generation = ++s_pack_generation;
 }
 
+/* Scale the HD tiles are composed at. DKC1_HD_SCALE overrides; Switch
+ * defaults to 2x: a 4x pack is reduced at load, so one pack serves every
+ * platform. A requested scale must divide the pack's scale. */
+static uint32_t TargetScale(uint32_t pack_scale) {
+  const char *text = getenv("DKC1_HD_SCALE");
+  uint32_t want = text && *text ? (uint32_t)atoi(text) : 0;
+#ifdef __SWITCH__
+  if (!want) want = 2;
+#endif
+  if (!want || want > pack_scale || pack_scale % want)
+    return pack_scale;
+  return want;
+}
+
+static uint8_t *ReadWholeFile(const char *path, size_t *size) {
+  FILE *file = fopen(path, "rb");
+  if (!file)
+    return NULL;
+  uint8_t *blob = NULL;
+  long length = -1;
+  if (fseek(file, 0, SEEK_END) == 0)
+    length = ftell(file);
+  if (length > kHdPackHeaderSize && fseek(file, 0, SEEK_SET) == 0 &&
+      (blob = malloc((size_t)length)) != NULL &&
+      fread(blob, 1, (size_t)length, file) != (size_t)length) {
+    free(blob);
+    blob = NULL;
+  }
+  fclose(file);
+  if (blob)
+    *size = (size_t)length;
+  return blob;
+}
+
+/* Loads tiles-<s>x.bin for the target scale when the pack has one (the
+ * generator writes a properly resampled 2x file), else tiles.bin, reduced
+ * by sampling if the target scale is smaller. */
 static bool LoadPack(const char *dir, char *error, size_t error_size) {
   UnloadPack();
   char path[512];
-  snprintf(path, sizeof path, "%s/tiles.bin", dir);
-  FILE *file = fopen(path, "rb");
-  if (!file) {
-    snprintf(error, error_size, "cannot open %s", path);
-    return false;
+  size_t size = 0;
+  uint8_t *blob = NULL;
+  const uint32_t want = TargetScale(kHdMaxScale);
+  if (want != kHdMaxScale) {
+    snprintf(path, sizeof path, "%s/tiles-%ux.bin", dir, (unsigned)want);
+    blob = ReadWholeFile(path, &size);
   }
-  fseek(file, 0, SEEK_END);
-  const long size = ftell(file);
-  fseek(file, 0, SEEK_SET);
-  uint8_t *blob = size > kHdPackHeaderSize ? malloc((size_t)size) : NULL;
-  if (!blob || fread(blob, 1, (size_t)size, file) != (size_t)size) {
-    fclose(file);
-    free(blob);
+  if (!blob) {
+    snprintf(path, sizeof path, "%s/tiles.bin", dir);
+    blob = ReadWholeFile(path, &size);
+  }
+  if (!blob) {
     snprintf(error, error_size, "cannot read %s", path);
     return false;
   }
-  fclose(file);
   const uint32_t scale = ReadU32(blob + 12), count = ReadU32(blob + 16);
-  const size_t tile_bytes = (size_t)(8 * scale) * (8 * scale);
+  const size_t tile_bytes = (size_t)(8 * scale) * (8 * scale) * 2;
   const size_t index_end = kHdPackHeaderSize + (size_t)count * kHdPackEntrySize;
   const char *problem = NULL;
-  if (memcmp(blob, "DKC1HDP1", 8) || ReadU32(blob + 8) != 1)
-    problem = "not a DKC1 HD pack (v1)";
+  if (!memcmp(blob, "DKC1HDP1", 8))
+    problem = "old (v1) pack format: regenerate it with tools/hd_pack.py";
+  else if (memcmp(blob, "DKC1HDP2", 8) || ReadU32(blob + 8) != 2)
+    problem = "not a DKC1 HD pack (v2)";
   else if (memcmp(blob + 24, kRomSha256, sizeof kRomSha256))
     problem = "pack was built for a different ROM";
-  else if (scale < 1 || scale > kHdMaxScale)
+  else if (scale != 1 && scale != 2 && scale != 4)
     problem = "unsupported pack scale";
-  else if (index_end > (size_t)size)
+  else if (count > kDkc1HdGpuNoTile)
+    problem = "too many tiles";
+  else if (index_end > size)
     problem = "truncated tile index";
   for (uint32_t i = 0; !problem && i < count; i++) {
     const uint8_t *entry = blob + kHdPackHeaderSize + (size_t)i * kHdPackEntrySize;
-    if ((size_t)ReadU32(entry + 8) + tile_bytes > (size_t)size)
+    if ((size_t)ReadU32(entry + 8) + tile_bytes > size)
       problem = "tile data out of range";
     else if (i && ReadU64(entry) <= ReadU64(entry - kHdPackEntrySize))
       problem = "tile index not sorted";
@@ -160,30 +232,59 @@ static bool LoadPack(const char *dir, char *error, size_t error_size) {
     snprintf(error, error_size, "%s: %s", path, problem);
     return false;
   }
-  s_pack.blob = blob;
-  s_pack.size = (size_t)size;
-  s_pack.scale = scale;
+  /* Copy the tiles into index order, reducing the scale if needed by
+   * taking each reduced texel's top-left source texel. */
+  const uint32_t target = TargetScale(scale);
+  const uint32_t factor = scale / target;
+  const size_t out_span = 8 * target, in_span = 8 * scale;
+  uint16_t *tiles = malloc((size_t)count * out_span * out_span * 2 + 2);
+  uint64_t *keys = malloc((size_t)count * sizeof *keys + 8);
+  if (!tiles || !keys) {
+    free(tiles);
+    free(keys);
+    free(blob);
+    snprintf(error, error_size, "%s: out of memory", path);
+    return false;
+  }
+  for (uint32_t i = 0; i < count; i++) {
+    const uint8_t *entry = blob + kHdPackHeaderSize + (size_t)i * kHdPackEntrySize;
+    const uint8_t *src = blob + ReadU32(entry + 8);
+    uint16_t *dst = tiles + (size_t)i * out_span * out_span;
+    keys[i] = ReadU64(entry);
+    for (size_t y = 0; y < out_span; y++)
+      for (size_t x = 0; x < out_span; x++) {
+        const uint8_t *t = src + ((y * factor) * in_span + x * factor) * 2;
+        dst[y * out_span + x] = (uint16_t)(t[0] | t[1] << 8);
+      }
+  }
+  /* Tiles and keys are copied out; the file image is not needed. */
+  free(blob);
+  s_pack.blob = NULL;
+  s_pack.size = size;
+  s_pack.scale = target;
   s_pack.count = count;
+  s_pack.tiles = tiles;
+  s_pack.keys = keys;
+  s_pack.generation = ++s_pack_generation;
   snprintf(s_pack.path, sizeof s_pack.path, "%s", dir);
   return true;
 }
 
-static const uint8_t *PackFind(uint64_t key) {
+/* Index of a character's HD tile in s_pack.tiles, or -1. */
+static int32_t PackFind(uint64_t key) {
   size_t lo = 0, hi = s_pack.count;
   while (lo < hi) {
     const size_t mid = (lo + hi) / 2;
-    const uint8_t *entry =
-        s_pack.blob + kHdPackHeaderSize + mid * kHdPackEntrySize;
-    const uint64_t k = ReadU64(entry);
+    const uint64_t k = s_pack.keys[mid];
     if (k == key)
-      return s_pack.blob + ReadU32(entry + 8);
+      return (int32_t)mid;
     if (k < key) lo = mid + 1; else hi = mid;
   }
-  return NULL;
+  return -1;
 }
 
 void Dkc1HdSetSource(Dkc1HdSource source, int scale) {
-  if (source == kDkc1HdSourcePack && !s_pack.blob)
+  if (source == kDkc1HdSourcePack && !s_pack.tiles)
     source = kDkc1HdSourceNone;
   if (source == kDkc1HdSourcePack)
     scale = (int)s_pack.scale;
@@ -221,19 +322,23 @@ void Dkc1HdInitializeFromEnvironment(void) {
   int scale = scale_text && *scale_text ? atoi(scale_text) : kHdMaxScale;
   const char *pack = getenv("DKC1_HD_PACK");
 #ifdef __SWITCH__
-  /* No menu on Switch: a pack in the app directory enables the mod. */
+  /* No menu on Switch: a pack in the app directory enables the mod. The
+   * 2x file alone is enough (it is what the Switch loads). */
   if (!pack || !*pack) {
-    FILE *probe = fopen("hd/tiles.bin", "rb");
-    if (probe) {
-      fclose(probe);
-      pack = "hd";
+    static const char *const kProbes[] = {"hd/tiles-2x.bin", "hd/tiles.bin"};
+    for (size_t i = 0; i < sizeof kProbes / sizeof kProbes[0] && !pack; i++) {
+      FILE *probe = fopen(kProbes[i], "rb");
+      if (probe) {
+        fclose(probe);
+        pack = "hd";
+      }
     }
   }
 #endif
   const char *debug = getenv("DKC1_HD_DEBUG");
   s_debug_misses = debug && strcmp(debug, "misses") == 0;
-  const char *deblock = getenv("DKC1_HD_DEBLOCK");
-  s_deblock = !deblock || *deblock != '0';
+  const char *shape = getenv("DKC1_HD_SHAPE");
+  s_shape = !shape || *shape != '0';
   if (debug && strcmp(debug, "grid") == 0) {
     source = kDkc1HdSourceGrid;
   } else if (EnvironmentEnabled("DKC1_HD_IDENTITY")) {
@@ -291,9 +396,11 @@ void Dkc1HdPrepareFrame(Ppu *ppu) {
     PpuSetIdentityCapture(ppu, NULL, 0, NULL);
     return;
   }
-  memset(s_gbuf, 0, sizeof s_gbuf);
+  /* The PPU rewrites every identity row it draws (including the columns it
+   * does not compose); only the per-line records need a fresh start. */
   memset(s_lines, 0, sizeof s_lines);
   PpuSetIdentityCapture(ppu, s_gbuf, kPpuBufWidth, s_lines);
+  PpuSetIdentityShape(ppu, s_shape);
 }
 
 typedef struct HdLineMaps {
@@ -305,11 +412,11 @@ typedef struct HdLineMaps {
 /* Walks one HD tile's texels for a native pixel: texel (u, v) of the block
  * is p[v * dv + u * du], with the tile's flips folded into the steps. */
 typedef struct HdTexelWalk {
-  const uint8_t *p;
+  const uint16_t *p;
   int du, dv;
 } HdTexelWalk;
 
-static bool TexelWalk(const uint8_t *tile, uint32_t ref, HdTexelWalk *walk) {
+static bool TexelWalk(const uint16_t *tile, uint32_t ref, HdTexelWalk *walk) {
   if (!tile)
     return false;
   const int s = s_scale, span = 8 * s;
@@ -406,63 +513,105 @@ static uint8_t IdentityIndex(const uint16_t *vram, uint32_t ref,
 }
 
 /* Pack tile for a capture ref, hashed once per character per frame. */
-static const uint8_t *PackTile(const uint16_t *vram, uint32_t ref) {
+/* Pack tile index of the character a ref points at, -1 when absent. */
+static int32_t PackTileIndex(const uint16_t *vram, uint32_t ref) {
   if (!(ref & kPpuIdentRef_Valid))
-    return NULL;
+    return -1;
   const unsigned base = (ref & 0x7fff) & ~7u;
   HdCharSlot *slot = &s_chars[base >> 3];
-  if (slot->stamp != s_stats.frames) {
-    slot->stamp = s_stats.frames;
-    slot->key = CharKey(vram, base, (ref >> kPpuIdentRef_DepthShift) & 3);
-    slot->tile = PackFind(slot->key);
-  }
-  return slot->tile;
+  if (HD_LOAD_ACQUIRE(&slot->stamp) == s_stats.frames)
+    return slot->tile_index;
+  const uint64_t key =
+      CharKey(vram, base, (ref >> kPpuIdentRef_DepthShift) & 3);
+  const int32_t index = PackFind(key);
+  HD_STORE_RELAXED(&slot->key, key);
+  HD_STORE_RELAXED(&slot->tile_index, index);
+  HD_STORE_RELEASE(&slot->stamp, s_stats.frames);
+  return index;
 }
 
-/* Pack texel (palette-relative, 0 = transparent) under HD subpixel (u, v)
- * of the native pixel a ref describes. */
-static FORCEINLINE unsigned PackTexel(const uint8_t *tile, uint32_t ref,
-                                      int u, int v) {
-  const int s = s_scale, span = 8 * s;
-  const int cu = (ref & kPpuIdentRef_HFlip) ? s - 1 - u : u;
-  const int cv = (ref & kPpuIdentRef_VFlip) ? s - 1 - v : v;
-  const int col = (ref >> kPpuIdentRef_ColShift) & 7, row = ref & 7;
-  return tile[(row * s + cv) * span + col * s + cu];
+static const uint16_t *PackTile(const uint16_t *vram, uint32_t ref) {
+  const int32_t index = PackTileIndex(vram, ref);
+  return index < 0 ? NULL
+                   : s_pack.tiles + (size_t)index * (8 * s_pack.scale) *
+                                        (8 * s_pack.scale);
 }
 
 static FORCEINLINE uint8_t PaletteBase(uint8_t index, uint32_t ref) {
   return (uint8_t)(index & ~(RefColors(ref) - 1));
 }
 
-/* Main-screen palette index for HD subpixel (u, v): a cover tile that is
- * opaque in HD draws on top (silhouettes grow), the main tile otherwise,
- * and where the main tile is transparent in HD, whatever lies under it
- * (silhouettes shrink). Without shape data the native index stays. */
-static FORCEINLINE uint8_t ShapedMainIndex(const PpuIdentityPixel *gp,
-                                           const uint8_t *main_tile,
-                                           const uint8_t *under_tile,
-                                           const uint8_t *cover_tile, int u,
-                                           int v) {
-  if (cover_tile) {
-    const unsigned t = PackTexel(cover_tile, gp->cover_ref, u, v);
-    if (t)
-      return (uint8_t)(gp->cover_base | t);
+/* ---- v2 texel colors ------------------------------------------------------
+ * Channels are kept as floats in 5-bit units through the blend and the
+ * color math, then expanded and dimmed as the PPU does. The GPU compose
+ * pass (dkc1_hd_gpu.c) runs the same operations in the same order. With
+ * whole weights (0 or 255) every step equals the PPU's integer one. */
+typedef struct HdRgb {
+  float r, g, b;
+} HdRgb;
+
+static FORCEINLINE HdRgb Rgb15(uint16_t c) {
+  return (HdRgb){(float)(c & 31), (float)((c >> 5) & 31),
+                 (float)((c >> 10) & 31)};
+}
+
+/* An HD texel's color: index i's blended toward j's by w/255, where a
+ * transparent index (0) stands for `under`, whatever lies below. */
+static FORCEINLINE HdRgb BlendTexel(const PpuIdentityLine *line,
+                                    uint16_t texel, unsigned base,
+                                    HdRgb under) {
+  const unsigned i = (texel >> 4) & 15, j = texel & 15;
+  const float w = (float)(texel >> 8) / 255.0f;
+  const HdRgb a = i ? Rgb15(line->cgram[(base | i) & 255]) : under;
+  const HdRgb b = j ? Rgb15(line->cgram[(base | j) & 255]) : under;
+  return (HdRgb){a.r + (b.r - a.r) * w, a.g + (b.g - a.g) * w,
+                 a.b + (b.b - a.b) * w};
+}
+
+/* (c << 3) | (c >> 2) for 5-bit c, interpolated between whole values. */
+static FORCEINLINE float Expand5(float c) {
+  const int lo = (int)c;
+  const int hi = lo < 31 ? lo + 1 : 31;
+  const float e0 = (float)((lo << 3) | (lo >> 2));
+  const float e1 = (float)((hi << 3) | (hi >> 2));
+  return e0 + (e1 - e0) * (c - (float)lo);
+}
+
+/* The PPU halves whole values with a shift (floor). A blend that lands on
+ * a whole value only within float noise, which differs between the CPU and
+ * a GPU that fuses multiply-adds, must take the same branch on both. */
+static FORCEINLINE float HalfChannel(float c) {
+  const float whole = floorf(c + 0.5f);
+  return fabsf(c - whole) < 1e-3f ? floorf(whole * 0.5f) : c * 0.5f;
+}
+
+/* Color math, clamping and brightness: PpuDrawWholeLine for one subpixel. */
+static uint32_t FinishColor(const PpuIdentityLine *line, uint8_t flags,
+                            HdRgb m, HdRgb sub) {
+  if (flags & kPpuIdentFlag_Clip)
+    m = (HdRgb){0, 0, 0};
+  if (flags & kPpuIdentFlag_Math) {
+    if (flags & kPpuIdentFlag_Subtract) {
+      m.r = fmaxf(m.r - sub.r, 0.0f);
+      m.g = fmaxf(m.g - sub.g, 0.0f);
+      m.b = fmaxf(m.b - sub.b, 0.0f);
+    } else {
+      m.r += sub.r;
+      m.g += sub.g;
+      m.b += sub.b;
+    }
+    if (flags & kPpuIdentFlag_Half) {
+      m.r = HalfChannel(m.r);
+      m.g = HalfChannel(m.g);
+      m.b = HalfChannel(m.b);
+    }
   }
-  if (!main_tile)
-    return gp->main_index;
-  const unsigned t = PackTexel(main_tile, gp->main_ref, u, v);
-  if (t)
-    return (uint8_t)(PaletteBase(gp->main_index, gp->main_ref) | t);
-  if (!(gp->under_ref & kPpuIdentRef_Valid))
-    return gp->main_index;
-  if (!gp->under_index)
-    return 0;  /* backdrop */
-  if (under_tile) {
-    const unsigned under = PackTexel(under_tile, gp->under_ref, u, v);
-    if (under)
-      return (uint8_t)(PaletteBase(gp->under_index, gp->under_ref) | under);
-  }
-  return gp->under_index;
+  const float bright = (float)line->brightness;
+  const float c[3] = {fminf(m.r, 31.0f), fminf(m.g, 31.0f), fminf(m.b, 31.0f)};
+  uint32_t out = 0;
+  for (int k = 0; k < 3; k++)
+    out |= (uint32_t)floorf(Expand5(c[k]) * bright / 15.0f) << (16 - 8 * k);
+  return out;
 }
 
 static bool EnsureOutput(int width) {
@@ -780,15 +929,29 @@ static void FrameContext(const Ppu *ppu, int width, int x0, int y0,
 /* Score one on-screen occurrence of a main-screen character and keep the
  * best one: fully visible, unblended, full brightness, with in-frame
  * context. The crop comes from the character's own layer (LayerContext). */
+static uint64_t s_dump_8bpp_sightings;
+
+/* `sub`: score the sub-screen pixel instead of the main one. Some scenes
+ * draw a layer on the main screen with a black palette and show it through
+ * color math from the sub screen (Cranky's intro stage): only the sub-screen
+ * sighting carries the character's real colors. */
 static void DumpOccurrence(const Ppu *ppu, int width, int x, int y,
-                           const PpuIdentityPixel *gp) {
-  const uint32_t ref = gp->main_ref;
+                           const PpuIdentityPixel *gp, bool sub) {
+  const uint32_t ref = sub ? gp->sub_ref : gp->main_ref;
+  const uint8_t pixel_index = sub ? gp->sub_index : gp->main_index;
+  const uint8_t pixel_layer = sub ? gp->sub_layer : gp->main_layer;
   const unsigned base = (ref & 0x7fff) & ~7u;
   HdCharSlot *slot = &s_chars[base >> 3];
-  if (slot->dump_stamp == s_stats.frames)
+  if (slot->dump_stamp[sub] == s_stats.frames)
     return;
-  slot->dump_stamp = s_stats.frames;
+  slot->dump_stamp[sub] = s_stats.frames;
   const unsigned depth = (ref >> kPpuIdentRef_DepthShift) & 3;
+  if (depth == kPpuIdentDepth_8bpp) {
+    /* Records hold 16 words: an 8bpp character (32) cannot be dumped yet.
+     * Counted so a dump shows whether the game uses any. */
+    s_dump_8bpp_sightings++;
+    return;
+  }
   uint16_t words[16] = {0};
   const unsigned nwords = depth == kPpuIdentDepth_2bpp ? 8 : 16;
   for (unsigned i = 0; i < nwords; i++)
@@ -814,7 +977,8 @@ static void DumpOccurrence(const Ppu *ppu, int width, int x, int y,
       const int sy = y0 + (vflip ? 7 - tr : tr);
       if (sx < 0 || sx >= width || sy < 0 || sy >= kHdHeight)
         continue;
-      const uint32_t r = s_gbuf[(size_t)sy * kPpuBufWidth + sx].main_ref;
+      const PpuIdentityPixel *other = &s_gbuf[(size_t)sy * kPpuBufWidth + sx];
+      const uint32_t r = sub ? other->sub_ref : other->main_ref;
       if ((r & kPpuIdentRef_Valid) && ((r & 0x7fff) & ~7u) == base &&
           (int)((r >> kPpuIdentRef_ColShift) & 7) == tc && (int)(r & 7) == tr)
         visible++;
@@ -824,9 +988,36 @@ static void DumpOccurrence(const Ppu *ppu, int width, int x, int y,
     return;
   const bool inside = x0 >= kHdCropRing && x0 + 8 + kHdCropRing <= width &&
                       y0 >= kHdCropRing && y0 + 8 + kHdCropRing <= kHdHeight;
+  /* Palette quality: how many distinct colors the character's own indices
+   * show with this palette, and (tie-break) how bright they are. Without it
+   * a scene that fades in by writing CGRAM kept the first, still-black
+   * sighting of each character (equal geometry scores never replace the
+   * first), and the pack got flat one-index tiles: the Nintendo logo. */
+  const unsigned colors_n = depth == kPpuIdentDepth_2bpp ? 4 : 16;
+  const unsigned base_index = pixel_index & ~(colors_n - 1);
+  bool used_index[16] = {false};
+  for (int tr = 0; tr < 8; tr++)
+    for (int tc = 0; tc < 8; tc++)
+      used_index[DecodeCharTexel(words, depth, (unsigned)tc, (unsigned)tr) &
+                 15] = true;
+  uint16_t distinct[16];
+  int distinct_n = 0;
+  unsigned luminance = 0;
+  for (unsigned i = 1; i < colors_n; i++) {
+    if (!used_index[i])
+      continue;
+    const uint16_t c = s_lines[y].cgram[base_index + i] & 0x7fff;
+    luminance += (c & 31u) + ((c >> 5) & 31u) + ((c >> 10) & 31u);
+    bool seen = false;
+    for (int k = 0; k < distinct_n; k++)
+      seen |= distinct[k] == c;
+    if (!seen)
+      distinct[distinct_n++] = c;
+  }
   const float score = 4.0f * (float)visible / (float)opaque +
                       (inside ? 1.0f : 0.0f) +
-                      ((gp->flags & kPpuIdentFlag_Math) ? 0.0f : 1.0f);
+                      ((gp->flags & kPpuIdentFlag_Math) ? 0.0f : 1.0f) +
+                      0.5f * (float)distinct_n + luminance / 100000.0f;
   if (score <= record->score)
     return;
   record->score = score;
@@ -835,7 +1026,7 @@ static void DumpOccurrence(const Ppu *ppu, int width, int x, int y,
   record->vflip = vflip;
   memcpy(record->raw, words, sizeof record->raw);
   const unsigned colors = depth == kPpuIdentDepth_2bpp ? 4 : 16;
-  const unsigned palette_base = gp->main_index & ~(colors - 1);
+  const unsigned palette_base = pixel_index & ~(colors - 1);
   for (unsigned i = 0; i < 16; i++) {
     const uint16_t c = i < colors ? s_lines[y].cgram[palette_base + i] : 0;
     const unsigned rgb[3] = {c & 31u, (c >> 5) & 31u, (c >> 10) & 31u};
@@ -845,7 +1036,7 @@ static void DumpOccurrence(const Ppu *ppu, int width, int x, int y,
   /* has_crop: 1 = layer-isolated context (its alpha is the layer's own
    * transparency), 2 = composed-frame fallback (alpha carries nothing). */
   record->has_crop = 1;
-  if (!LayerContext(ppu, gp->main_layer, base, depth, hflip, vflip,
+  if (!LayerContext(ppu, pixel_layer, base, depth, hflip, vflip,
                     x0 - (width - kPpuXPixels) / 2, y0, record->crop)) {
     FrameContext(ppu, width, x0, y0, record->crop);
     record->has_crop = 2;
@@ -897,7 +1088,8 @@ static void WriteDump(void) {
     fwrite(r->crop, 1, sizeof r->crop, file);
   }
   fclose(file);
-  fprintf(stderr, "[hd] dumped %zu characters to %s\n", s_dump_count, path);
+  fprintf(stderr, "[hd] dumped %zu characters to %s (8bpp sightings skipped: %llu)\n",
+          s_dump_count, path, (unsigned long long)s_dump_8bpp_sightings);
 }
 
 /* ---- Composition --------------------------------------------------------- */
@@ -914,16 +1106,6 @@ static void ComposeRows(Ppu *ppu, int width, int y0, int y1,
     const PpuIdentityLine *line = &s_lines[y];
     HdLineMaps maps;
     BuildLineMaps(line->brightness, &maps);
-    /* Unblended, unclipped color of every CGRAM index on this line. */
-    uint32_t line_lut[256];
-    if (pack) {
-      for (int i = 0; i < 256; i++) {
-        const uint16_t c = line->cgram[i];
-        line_lut[i] = (uint32_t)maps.mult[(c >> 10) & 31] |
-                      (uint32_t)maps.mult[(c >> 5) & 31] << 8 |
-                      (uint32_t)maps.mult[c & 31] << 16;
-      }
-    }
     for (int x = 0; x < width; x++) {
       const PpuIdentityPixel *gp = &s_gbuf[(size_t)y * kPpuBufWidth + x];
       const uint32_t native_rgb = native[x] & 0xffffff;
@@ -950,18 +1132,18 @@ static void ComposeRows(Ppu *ppu, int width, int y0, int y1,
                              !(gp->flags & kPpuIdentFlag_SubFixed);
       if (gp->main_ref & kPpuIdentRef_Valid) {
         stats->main_identity++;
-        if (dumping) DumpOccurrence(ppu, width, x, y, gp);
+        if (dumping) DumpOccurrence(ppu, width, x, y, gp, false);
       }
-      if (sub_texel && (gp->sub_ref & kPpuIdentRef_Valid))
+      if (sub_texel && (gp->sub_ref & kPpuIdentRef_Valid)) {
         stats->sub_identity++;
+        if (dumping) DumpOccurrence(ppu, width, x, y, gp, true);
+      }
 
       if (pack) {
-        const uint8_t *main_tile = PackTile(ppu->vram, gp->main_ref);
-        const uint8_t *sub_tile =
+        const uint16_t *main_tile = PackTile(ppu->vram, gp->main_ref);
+        const uint16_t *sub_tile =
             sub_texel ? PackTile(ppu->vram, gp->sub_ref) : NULL;
-        const uint8_t *cover_tile = PackTile(ppu->vram, gp->cover_ref);
-        const uint8_t *under_tile =
-            gp->under_index ? PackTile(ppu->vram, gp->under_ref) : NULL;
+        const uint16_t *cover_tile = PackTile(ppu->vram, gp->cover_ref);
         if (main_tile) stats->pack_hits++;
         else if (gp->main_ref & kPpuIdentRef_Valid) stats->pack_misses++;
         if (!main_tile && !sub_tile && !cover_tile) {
@@ -969,46 +1151,38 @@ static void ComposeRows(Ppu *ppu, int width, int y0, int y1,
                               ? 0xff00ff : native_rgb);
           continue;
         }
-        HdTexelWalk mw, uw, cw, sw;
+        HdTexelWalk mw, cw, sw;
         const bool has_main = TexelWalk(main_tile, gp->main_ref, &mw);
-        const bool has_under = TexelWalk(under_tile, gp->under_ref, &uw);
         const bool has_cover = TexelWalk(cover_tile, gp->cover_ref, &cw);
         const bool has_sub = TexelWalk(sub_tile, gp->sub_ref, &sw);
         const uint8_t main_base = PaletteBase(gp->main_index, gp->main_ref);
-        const uint8_t under_base = PaletteBase(gp->under_index, gp->under_ref);
         const uint8_t sub_base = PaletteBase(gp->sub_index, gp->sub_ref);
-        const bool under_known = (gp->under_ref & kPpuIdentRef_Valid) != 0;
-        const bool plain = !(gp->flags & kPpuIdentFlag_Math);
-        const uint32_t *lut = (gp->flags & kPpuIdentFlag_Clip) ? NULL : line_lut;
+        /* What a transparent main texel shows: the native main color when
+         * nothing is known below it, else the backdrop or the native
+         * color of the pixel underneath. */
+        const HdRgb main_native = Rgb15(line->cgram[gp->main_index]);
+        const HdRgb below = !(gp->under_ref & kPpuIdentRef_Valid)
+                                ? main_native
+                                : Rgb15(line->cgram[gp->under_index]);
+        const HdRgb sub_native =
+            Rgb15((gp->flags & kPpuIdentFlag_SubFixed)
+                      ? line->fixed_color
+                      : line->cgram[gp->sub_index]);
         for (int v = 0; v < s_scale; v++) {
           uint32_t *out = BlockRow(x, y, v);
           for (int u = 0; u < s_scale; u++) {
-            /* ShapedMainIndex, unrolled over the precomputed walks. */
-            unsigned t;
-            uint8_t main_index;
-            if (has_cover && (t = cw.p[v * cw.dv + u * cw.du]) != 0)
-              main_index = (uint8_t)(gp->cover_base | t);
-            else if (!has_main)
-              main_index = gp->main_index;
-            else if ((t = mw.p[v * mw.dv + u * mw.du]) != 0)
-              main_index = (uint8_t)(main_base | t);
-            else if (!under_known)
-              main_index = gp->main_index;
-            else if (!gp->under_index)
-              main_index = 0;
-            else if (has_under && (t = uw.p[v * uw.dv + u * uw.du]) != 0)
-              main_index = (uint8_t)(under_base | t);
-            else
-              main_index = gp->under_index;
-            if (plain) {
-              out[u] = lut ? lut[main_index] : 0;
-              continue;
-            }
-            uint8_t sub_index = gp->sub_index;
-            if (has_sub && (t = sw.p[v * sw.dv + u * sw.du]) != 0)
-              sub_index = (uint8_t)(sub_base | t);
-            out[u] = ComposeColor(line, &maps, main_index, sub_index,
-                                  gp->flags);
+            HdRgb m = has_main
+                ? BlendTexel(line, mw.p[v * mw.dv + u * mw.du], main_base,
+                             below)
+                : main_native;
+            if (has_cover)
+              m = BlendTexel(line, cw.p[v * cw.dv + u * cw.du],
+                             gp->cover_base, m);
+            const HdRgb sub = has_sub
+                ? BlendTexel(line, sw.p[v * sw.dv + u * sw.du], sub_base,
+                             sub_native)
+                : sub_native;
+            out[u] = FinishColor(line, gp->flags, m, sub);
           }
         }
         continue;
@@ -1044,6 +1218,160 @@ static void ComposeRows(Ppu *ppu, int width, int y0, int y1,
   }
 }
 
+/* ---- GPU composition inputs (dkc1_hd_gpu.c) -------------------------------
+ * The same per-pixel decisions as ComposeRows' pack path, one RGBA32UI
+ * texel per native pixel:
+ *   ref (26 bits): tile index (17 bits, kDkc1HdGpuNoTile = none) |
+ *                  col << 17 | row << 20 | hflip << 23 | vflip << 24 |
+ *                  2bpp << 25
+ *   x = main ref  | flags bits 0-4 << 27
+ *   y = cover ref | flags bits 5-7 << 27 | below-known << 30
+ *   z = sub ref (none unless the sub-screen texel shows) | mode << 27
+ *   w = main index | sub index << 8 | under index << 16 | cover base << 24,
+ *       or for a native-mode pixel its 0x00RRGGBB color
+ * Line rows: CGRAM[256], fixed color, brightness. */
+static bool s_gpu;
+static bool s_gpu_verify;
+static uint32_t *s_gpu_g;
+static uint16_t s_gpu_lines[kHdHeight * kDkc1HdGpuLineStride];
+static Dkc1HdGpuInputs s_gpu_inputs;
+
+static FORCEINLINE uint32_t GpuRef(uint32_t ref, int32_t index) {
+  return (index < 0 ? (uint32_t)kDkc1HdGpuNoTile : (uint32_t)index) |
+         ((ref >> kPpuIdentRef_ColShift) & 7) << 17 | (ref & 7) << 20 |
+         ((ref & kPpuIdentRef_HFlip) ? 1u << 23 : 0) |
+         ((ref & kPpuIdentRef_VFlip) ? 1u << 24 : 0) |
+         (RefColors(ref) == 4 ? 1u << 25 : 0);
+}
+
+/* Pack tile index for a ref. Neighbouring pixels nearly always share a
+ * character, so each role (main, cover, sub) remembers its last. */
+typedef struct HdTileMemo {
+  uint32_t base;
+  int32_t index;
+} HdTileMemo;
+
+static FORCEINLINE int32_t MemoTile(const uint16_t *vram, uint32_t ref,
+                                    HdTileMemo *memo) {
+  if (!(ref & kPpuIdentRef_Valid))
+    return -1;
+  const uint32_t base = (ref & 0x7fff) & ~7u;
+  if (base != memo->base) {
+    memo->base = base;
+    memo->index = PackTileIndex(vram, ref);
+  }
+  return memo->index;
+}
+
+static void EncodeGpuRows(Ppu *ppu, int width, int y0, int y1,
+                          Dkc1HdStats *stats) {
+  for (int y = y0; y < y1; y++) {
+    const uint32_t *native = (const uint32_t *)(ppu->renderBuffer +
+                                                (size_t)y * ppu->renderPitch);
+    const PpuIdentityLine *line = &s_lines[y];
+    uint16_t *line_out = &s_gpu_lines[y * kDkc1HdGpuLineStride];
+    memcpy(line_out, line->cgram, sizeof line->cgram);
+    line_out[256] = line->fixed_color;
+    line_out[257] = line->brightness;
+    HdLineMaps maps;
+    BuildLineMaps(line->brightness, &maps);
+    /* ComposeColor of a pixel without color math or clipping, per index:
+     * the self-check below only computes the full path for math pixels. */
+    uint32_t plain[256];
+    for (int i = 0; i < 256; i++) {
+      const uint16_t c = line->cgram[i];
+      plain[i] = (uint32_t)maps.mult[(c >> 10) & 31] |
+                 (uint32_t)maps.mult[(c >> 5) & 31] << 8 |
+                 (uint32_t)maps.mult[c & 31] << 16;
+    }
+    HdTileMemo main_memo = {~0u, -1}, cover_memo = {~0u, -1},
+               sub_memo = {~0u, -1};
+    const PpuIdentityPixel *row = &s_gbuf[(size_t)y * kPpuBufWidth];
+    uint32_t *g = &s_gpu_g[(size_t)y * width * 4];
+    for (int x = 0; x < width; x++, g += 4) {
+      const PpuIdentityPixel *gp = &row[x];
+      const uint32_t native_rgb = native[x] & 0xffffff;
+      /* Native mode unless the pixel is recomposed below. */
+      g[0] = g[1] = kDkc1HdGpuNoTile;
+      g[2] = kDkc1HdGpuNoTile | (uint32_t)kDkc1HdGpuModeNative << 27;
+      g[3] = native_rgb;
+      stats->pixels++;
+      if (!line->composed || !(gp->flags & kPpuIdentFlag_Composed)) {
+        stats->uncomposed++;
+        continue;
+      }
+      if (gp->flags & kPpuIdentFlag_Black) {
+        stats->black++;
+        continue;
+      }
+      const uint32_t expected =
+          (gp->flags & (kPpuIdentFlag_Math | kPpuIdentFlag_Clip))
+              ? ComposeColor(line, &maps, gp->main_index, gp->sub_index,
+                             gp->flags)
+              : plain[gp->main_index];
+      if (expected != native_rgb) {
+        stats->self_check_fail++;
+        continue;
+      }
+      const bool sub_texel = (gp->flags & kPpuIdentFlag_Math) &&
+                             !(gp->flags & kPpuIdentFlag_SubFixed);
+      if (gp->main_ref & kPpuIdentRef_Valid) stats->main_identity++;
+      if (sub_texel && (gp->sub_ref & kPpuIdentRef_Valid))
+        stats->sub_identity++;
+      const int32_t main_index = MemoTile(ppu->vram, gp->main_ref, &main_memo);
+      const int32_t sub_index =
+          sub_texel ? MemoTile(ppu->vram, gp->sub_ref, &sub_memo) : -1;
+      const int32_t cover_index =
+          MemoTile(ppu->vram, gp->cover_ref, &cover_memo);
+      if (main_index >= 0) stats->pack_hits++;
+      else if (gp->main_ref & kPpuIdentRef_Valid) stats->pack_misses++;
+      if (main_index < 0 && sub_index < 0 && cover_index < 0) {
+        if (s_debug_misses && (gp->main_ref & kPpuIdentRef_Valid))
+          g[2] = kDkc1HdGpuNoTile | (uint32_t)kDkc1HdGpuModeMagenta << 27;
+        continue;
+      }
+      const uint32_t flags = gp->flags;
+      const bool below_known = (gp->under_ref & kPpuIdentRef_Valid) != 0;
+      g[0] = GpuRef(gp->main_ref, main_index) | (flags & 31u) << 27;
+      g[1] = GpuRef(gp->cover_ref, cover_index) | ((flags >> 5) & 7u) << 27 |
+             (below_known ? 1u << 30 : 0);
+      g[2] = GpuRef(gp->sub_ref, sub_index) |
+             (uint32_t)kDkc1HdGpuModeCompose << 27;
+      g[3] = gp->main_index | (uint32_t)gp->sub_index << 8 |
+             (uint32_t)gp->under_index << 16 | (uint32_t)gp->cover_base << 24;
+    }
+  }
+}
+
+static bool EnsureGpuBuffers(int width) {
+  const size_t need = (size_t)width * kHdHeight * 4;
+  static size_t capacity;
+  if (need > capacity) {
+    uint32_t *g = realloc(s_gpu_g, need * sizeof *g);
+    if (!g) return false;
+    s_gpu_g = g;
+    capacity = need;
+  }
+  return true;
+}
+
+void Dkc1HdSetGpuComposition(bool enabled) {
+  s_gpu = enabled;
+  const char *verify = getenv("DKC1_HD_GPU_VERIFY");
+  s_gpu_verify = enabled && verify && *verify && *verify != '0';
+}
+
+bool Dkc1HdGpuComposition(void) {
+  return s_gpu;
+}
+
+const Dkc1HdGpuInputs *Dkc1HdGpuFrame(void) {
+  if (!s_gpu || !Dkc1HdEnabled() || s_source != kDkc1HdSourcePack ||
+      !s_gpu_inputs.width)
+    return NULL;
+  return &s_gpu_inputs;
+}
+
 /* Hash every character the frame references once, before the parallel
  * pass, so workers only read s_chars. */
 static void ResolvePackSlots(Ppu *ppu, int width) {
@@ -1076,6 +1404,7 @@ enum { kHdMaxWorkers = 8 };
 typedef struct HdBand {
   Ppu *ppu;
   int width, y0, y1;
+  bool gpu;  /* encode GPU inputs instead of composing on the CPU */
   Dkc1HdStats stats;
 } HdBand;
 
@@ -1106,9 +1435,15 @@ static HdBand s_bands[kHdMaxWorkers + 1];
 static uint64_t s_pool_generation;
 static int s_pool_pending;
 
+static void EncodeGpuRows(Ppu *ppu, int width, int y0, int y1,
+                          Dkc1HdStats *stats);
+
 static void RunBand(HdBand *band) {
   memset(&band->stats, 0, sizeof band->stats);
-  ComposeRows(band->ppu, band->width, band->y0, band->y1, &band->stats);
+  if (band->gpu)
+    EncodeGpuRows(band->ppu, band->width, band->y0, band->y1, &band->stats);
+  else
+    ComposeRows(band->ppu, band->width, band->y0, band->y1, &band->stats);
 }
 
 #if HD_WIN32_THREADS
@@ -1118,6 +1453,9 @@ static void *WorkerMain(void *arg)
 #endif
 {
   const int index = (int)(intptr_t)arg;
+#ifdef __SWITCH__
+  Dkc1SwitchPinWorker(index);
+#endif
   uint64_t seen = 0;
   for (;;) {
     POOL_LOCK();
@@ -1202,106 +1540,22 @@ static void AddStats(Dkc1HdStats *total, const Dkc1HdStats *part) {
     dst[i] += src[i];
 }
 
-/* ---- Tile-seam deblocking ----------------------------------------------
- * A pack stores one HD version per character, but a character can sit next
- * to different neighbours, so the HD edges of adjacent tiles need not meet.
- * Where two tiles of the same layer meet and the native picture has no
- * real edge there, spread the HD step over a ramp of one native pixel on
- * each side (the step left is 1/(2*scale+1) of the original). */
-enum { kHdSeamNativeStep = 24 };  /* max per-channel native step to smooth */
-
-static bool SeamBetween(const PpuIdentityPixel *a, const PpuIdentityPixel *b,
-                        bool vertical) {
-  if (!(a->main_ref & kPpuIdentRef_Valid) ||
-      !(b->main_ref & kPpuIdentRef_Valid) || a->main_layer != b->main_layer ||
-      (a->flags | b->flags) & kPpuIdentFlag_Black)
-    return false;
-  if (vertical) {
-    const unsigned ra = a->main_ref & 7, rb = b->main_ref & 7;
-    const unsigned sa = (a->main_ref & kPpuIdentRef_VFlip) ? 7 - ra : ra;
-    const unsigned sb = (b->main_ref & kPpuIdentRef_VFlip) ? 7 - rb : rb;
-    return sa == 7 && sb == 0;
-  }
-  const unsigned ca = (a->main_ref >> kPpuIdentRef_ColShift) & 7;
-  const unsigned cb = (b->main_ref >> kPpuIdentRef_ColShift) & 7;
-  const unsigned sa = (a->main_ref & kPpuIdentRef_HFlip) ? 7 - ca : ca;
-  const unsigned sb = (b->main_ref & kPpuIdentRef_HFlip) ? 7 - cb : cb;
-  return sa == 7 && sb == 0;
-}
-
-static bool NativeSmooth(uint32_t a, uint32_t b) {
-  for (int shift = 0; shift < 24; shift += 8) {
-    const int d = (int)((a >> shift) & 0xff) - (int)((b >> shift) & 0xff);
-    if (d > kHdSeamNativeStep || d < -kHdSeamNativeStep)
-      return false;
-  }
-  return true;
-}
-
-/* Ramp the step between p[0] (last pixel before the seam) and q[0] across
- * n pixels per side; p and q step away from the seam by `stride`. */
-static void RampSeam(uint32_t *p, uint32_t *q, int stride, int n) {
-  for (int shift = 0; shift < 24; shift += 8) {
-    const int d = (int)((q[0] >> shift) & 0xff) - (int)((p[0] >> shift) & 0xff);
-    if (!d)
-      continue;
-    for (int i = 0; i < n; i++) {
-      const int delta = d * (n - i) / (2 * n + 1);
-      uint32_t *pp = p - i * stride, *qq = q + i * stride;
-      int pv = (int)((*pp >> shift) & 0xff) + delta;
-      int qv = (int)((*qq >> shift) & 0xff) - delta;
-      pv = pv < 0 ? 0 : pv > 255 ? 255 : pv;
-      qv = qv < 0 ? 0 : qv > 255 ? 255 : qv;
-      *pp = (*pp & ~(0xffu << shift)) | (uint32_t)pv << shift;
-      *qq = (*qq & ~(0xffu << shift)) | (uint32_t)qv << shift;
-    }
-  }
-}
-
-static void DeblockSeams(const Ppu *ppu, int width) {
-  const int s = s_scale, pitch = s_out_width;
-  for (int y = 0; y < kHdHeight; y++) {
-    const uint32_t *native =
-        (const uint32_t *)(ppu->renderBuffer + (size_t)y * ppu->renderPitch);
-    const PpuIdentityPixel *row = &s_gbuf[(size_t)y * kPpuBufWidth];
-    for (int x = 0; x + 1 < width; x++) {
-      if (!SeamBetween(&row[x], &row[x + 1], false) ||
-          !NativeSmooth(native[x], native[x + 1]))
-        continue;
-      for (int v = 0; v < s; v++) {
-        uint32_t *line = s_out + (size_t)(y * s + v) * pitch;
-        RampSeam(&line[(x + 1) * s - 1], &line[(x + 1) * s], 1, s);
-      }
-    }
-    if (y + 1 == kHdHeight)
-      break;
-    const uint32_t *below =
-        (const uint32_t *)(ppu->renderBuffer + (size_t)(y + 1) * ppu->renderPitch);
-    const PpuIdentityPixel *next = &s_gbuf[(size_t)(y + 1) * kPpuBufWidth];
-    for (int x = 0; x < width; x++) {
-      if (!SeamBetween(&row[x], &next[x], true) ||
-          !NativeSmooth(native[x], below[x]))
-        continue;
-      for (int u = 0; u < s; u++) {
-        uint32_t *column = s_out + (size_t)x * s + u;
-        RampSeam(&column[(size_t)((y + 1) * s - 1) * pitch],
-                 &column[(size_t)((y + 1) * s) * pitch], pitch, s);
-      }
-    }
-  }
-}
-
-static void ComposeFrame(Ppu *ppu, int width) {
+/* Compose (or GPU-encode) the frame in row bands across the pool. */
+static void RunBands(Ppu *ppu, int width, bool gpu) {
   if (s_workers < 0)
     StartWorkers();
   if (s_dump_dir[0] || s_workers == 0) {
-    ComposeRows(ppu, width, 0, kHdHeight, &s_stats);
+    if (gpu)
+      EncodeGpuRows(ppu, width, 0, kHdHeight, &s_stats);
+    else
+      ComposeRows(ppu, width, 0, kHdHeight, &s_stats);
     return;
   }
   const int bands = s_workers + 1;
   for (int i = 0; i < bands; i++) {
     s_bands[i].ppu = ppu;
     s_bands[i].width = width;
+    s_bands[i].gpu = gpu;
     s_bands[i].y0 = kHdHeight * i / bands;
     s_bands[i].y1 = kHdHeight * (i + 1) / bands;
   }
@@ -1319,6 +1573,10 @@ static void ComposeFrame(Ppu *ppu, int width) {
     AddStats(&s_stats, &s_bands[i].stats);
 }
 
+static void ComposeFrame(Ppu *ppu, int width) {
+  RunBands(ppu, width, false);
+}
+
 void Dkc1HdFinishFrame(Ppu *ppu, int width) {
   PpuSetIdentityCapture(ppu, NULL, 0, NULL);
   if (!Dkc1HdEnabled() || !ppu->renderBuffer || width <= 0 ||
@@ -1326,17 +1584,47 @@ void Dkc1HdFinishFrame(Ppu *ppu, int width) {
     return;
   const uint64_t start = NowNs();
   s_stats.frames++;
-  if (s_source == kDkc1HdSourcePack)
+  {
+    /* DKC1_HD_CAPTURE_ONLY=1 (measurement): stop after the PPU capture. */
+    static int capture_only = -1;
+    if (capture_only < 0) {
+      const char *v = getenv("DKC1_HD_CAPTURE_ONLY");
+      capture_only = v && *v && *v != '0';
+    }
+    if (capture_only)
+      return;
+  }
+  if (s_source == kDkc1HdSourcePack && !s_gpu)
     ResolvePackSlots(ppu, width);
-  ComposeFrame(ppu, width);
-  if (s_source == kDkc1HdSourcePack && s_deblock)
-    DeblockSeams(ppu, width);
+  if (s_gpu && s_source == kDkc1HdSourcePack && EnsureGpuBuffers(width)) {
+    RunBands(ppu, width, true);
+    s_gpu_inputs = (Dkc1HdGpuInputs){
+      .width = width,
+      .height = kHdHeight,
+      .scale = s_scale,
+      .g = s_gpu_g,
+      .lines = s_gpu_lines,
+      .tiles = s_pack.tiles,
+      .tile_count = s_pack.count,
+      .tiles_generation = s_pack.generation,
+    };
+    if (s_gpu_verify) {
+      /* Reference CPU composition of the same frame for comparison. */
+      Dkc1HdStats discard = s_stats;
+      ComposeFrame(ppu, width);
+      s_stats = discard;
+    }
+  } else {
+    ComposeFrame(ppu, width);
+  }
   s_stats.compose_ns += NowNs() - start;
 }
 
 const uint32_t *Dkc1HdOutput(int *width, int *height, size_t *pitch_pixels) {
   if (!Dkc1HdEnabled() || !s_out || !s_out_width)
     return NULL;
+  if (s_gpu && s_source == kDkc1HdSourcePack && !s_gpu_verify)
+    return NULL;  /* composed on the GPU; see Dkc1HdGpuFrame */
   if (width) *width = s_out_width;
   if (height) *height = s_out_height;
   if (pitch_pixels) *pitch_pixels = (size_t)s_out_width;

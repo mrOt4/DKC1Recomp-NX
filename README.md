@@ -3,6 +3,25 @@ Yes, I used AI.
 No, I don't care about your opinion
 This was to simply port a game I love to Switch without spending a week.
 
+# DKC1Recomp-NX 1.0
+
+This fork adds, on top of DKC1Recomp and its Switch port:
+
+- **Nintendo Switch at 60 fps**: own audren audio output, fixed 60 Hz frame
+  cadence, CPU at 1785 MHz, emulation and HD work on separate cores, and an
+  in-game menu (R3, or Plus + Minus) with save states, rewind, MSU-1 and HD
+  switches, cheats (infinite lives, Pro Action Replay codes) and a
+  frame-time HUD. See [docs/SWITCH.md](docs/SWITCH.md).
+- **HD texture mod** generated from your own ROM (pack format v2: two
+  palette colors and a blend weight per HD pixel, composed on the GPU). See
+  [docs/HD_MOD_README.md](docs/HD_MOD_README.md) and
+  [docs/HD_REMASTER.md](docs/HD_REMASTER.md).
+- **Compressed MSU-1 music** (Ogg Vorbis, decoded on its own thread, with
+  windowed-sinc resampling).
+- **Widescreen HUD**: banana and lives counters anchored to the screen edges.
+
+No ROM, graphics or music are included or distributed.
+
 # DKC1Recomp
 
 Static recompilation of *Donkey Kong Country* (SNES, USA v1.0) into a native

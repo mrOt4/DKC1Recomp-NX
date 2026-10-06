@@ -69,3 +69,11 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+## font8x8
+
+`third_party/font8x8/font8x8_basic.h` comes from
+https://github.com/dhepper/font8x8 (commit
+8e279d2d864e79128e96188a6b9526cfa3fbfef9), by Daniel Hepper, after the
+IBM VGA fonts as collected by Marcel Sondaar. It is in the public domain.
+The Switch in-game menu uses it to draw text.

@@ -2,6 +2,7 @@
  * Only immutable completed host pixels are read. No guest state is touched. */
 #include "windows_platform.h"
 #include "desktop_crt.h"
+#include "dkc1_hd_gpu.h"
 #include <SDL_opengl.h>
 #include <SDL_opengl_glext.h>
 #include <stdio.h>
@@ -99,6 +100,11 @@ bool Dkc1WindowsGraphicsInit(SDL_Window *window) {
   }
   pDeleteShader(vertex); pGenVertexArrays(1,&s_vao);pGenFramebuffers(1,&s_fbo);
   SDL_GL_SetSwapInterval(0); /* QPC is the single 60 Hz producer authority. */
+  /* HD texture frames are composed on the GPU unless DKC1_HD_GPU=0. */
+  {
+    const char *gpu=getenv("DKC1_HD_GPU");
+    if(!(gpu&&*gpu=='0')&&Dkc1HdGpuInit(false))Dkc1HdSetGpuComposition(true);
+  }
   fprintf(stderr,"[windows-graphics] OpenGL %s; all %d shader passes ready\n",glGetString(GL_VERSION),(int)PassCount);
   return true;
 }
@@ -158,9 +164,24 @@ void Dkc1WindowsGraphicsDrawHd(const uint32_t *pixels,int w,int h,int display_wi
   float u[27]={(float)w,(float)h,(float)vw,(float)vh};
   if(!Pass(Hd,&s_hd_input,NULL,x,y,vw,vh,u))fprintf(stderr,"[windows-graphics] HD pass failed\n");
 }
+/* HD texture frame composed on the GPU (dkc1_hd_gpu.c), fitted like the
+ * native picture. Returns false when composition failed. */
+bool Dkc1WindowsGraphicsDrawHdGpu(const Dkc1HdGpuInputs *in,int display_width,int logical_height) {
+  if(!s_context||!in||display_width<1||logical_height<1)return false;
+  SDL_GL_MakeCurrent(s_window,s_context);
+  int ow,oh;SDL_GL_GetDrawableSize(s_window,&ow,&oh);if(ow<1||oh<1)return false;
+  int vw=ow,vh=ow*logical_height/display_width;
+  if(vh>oh){vh=oh;vw=oh*display_width/logical_height;}
+  if(!Dkc1HdGpuCompose(in))return false;
+  pBindFramebuffer(GL_FRAMEBUFFER,0);glViewport(0,0,ow,oh);glClearColor(0,0,0,1);glClear(GL_COLOR_BUFFER_BIT);
+  Dkc1HdGpuPresent(0,(ow-vw)/2,(oh-vh)/2,vw,vh);
+  pBindVertexArray(s_vao);
+  return true;
+}
 void Dkc1WindowsGraphicsSwap(void){if(s_context)SDL_GL_SwapWindow(s_window);}
 void Dkc1WindowsGraphicsClose(void){
   if(!s_context)return;
+  Dkc1HdGpuShutdown();
   Target *targets[]={&s_input,&s_hd_input,&s_lines,&s_beam,&s_glow[0],&s_glow[1],&s_halo[0],&s_halo[1]};
   for(int i=0;i<8;i++){glDeleteTextures(1,&targets[i]->texture);memset(targets[i],0,sizeof(Target));}
   for(int i=0;i<PassCount;i++){pDeleteProgram(s_programs[i]);s_programs[i]=0;}

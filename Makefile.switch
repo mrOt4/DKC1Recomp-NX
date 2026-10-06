@@ -27,7 +27,7 @@ TARGET		:=	dkc1
 BUILD		:=	build-switch
 APP_TITLE	:=	Donkey Kong Country
 APP_AUTHOR	:=	elliotttate and Souldbminer
-APP_VERSION	:=	0.1.0
+APP_VERSION	:=	1.0.0
 
 # SD layout: sdmc:/switch/<SWITCH_APP_DIR>/rom.smc (+config, saves).
 SWITCH_APP_DIR	?=	dkc1
@@ -61,6 +61,8 @@ GAME_CFILES := \
 	$(TOPDIR)/runner/dkc1_baby_kong_animation.c \
 	$(TOPDIR)/runner/dkc1_baby_kong_movement.c \
 	$(TOPDIR)/runner/dkc1_hd.c \
+	$(TOPDIR)/runner/dkc1_hd_gpu.c \
+	$(TOPDIR)/runner/dkc1_overlay_menu.c \
 	$(TOPDIR)/runner/dkc1_margin_proxy.c \
 	$(TOPDIR)/runner/dkc1_ws_trace.c \
 	$(TOPDIR)/runner/input_playback.c \
@@ -84,7 +86,9 @@ GAME_CFILES := \
 	$(TOPDIR)/runner/desktop_filter.c \
 	$(TOPDIR)/runner/desktop_graphics.c \
 	$(TOPDIR)/runner/switch_platform.c \
-	$(TOPDIR)/runner/switch_gamepad.c
+	$(TOPDIR)/runner/switch_gamepad.c \
+	$(TOPDIR)/runner/switch_clock.c \
+	$(TOPDIR)/runner/switch_audio.c
 
 # Early dirs win bare-header resolution (notably runner/ headers over any
 # same-named framework ones). The framework dirs must precede any
@@ -96,7 +100,7 @@ GAME_INCLUDES_EARLY := \
 GAME_INCLUDES_LATE :=
 
 GAME_DEFS := \
-	-DDKC1_RELEASE_VERSION='"0.1.0-switch"' \
+	-DDKC1_RELEASE_VERSION='"1.0.0-switch"' \
 	-DSNESRECOMP_REVERSE_DEBUG=0 \
 	-DSNESRECOMP_EXTERNAL_RAM_ROUTINE_GUARDS=1 \
 	-DSYSTEM_VOLUME_MIXER_AVAILABLE=0 \
@@ -104,8 +108,8 @@ GAME_DEFS := \
 	-DDKC1_REAL_HOST_REPORT=1 \
 	-DSWITCH_APP_DIR='"$(SWITCH_APP_DIR)"'
 
-# Debug-only Switch extras: make -f Makefile.switch DEBUG=1
-# (L3 = quick-save, R3 = quick-load). Off by default.
+# Debug-only Switch extras: make -f Makefile.switch DEBUG=1. Off by
+# default. (State save/load lives in the in-game menu.)
 ifdef DEBUG
 GAME_DEFS += -DSWITCH_DEBUG
 endif

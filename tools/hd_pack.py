@@ -10,14 +10,17 @@ Pipeline:
      and raw planar data.
   2. Lay the crops out on sheets with edge-replicated padding and upscale
      the sheets with Real-ESRGAN (ncnn-vulkan build).
-  3. Cut each tile's centre back out, undo its on-screen flips, and
-     requantize every HD pixel to the nearest colour (OKLab) among the
-     palette entries that character itself uses. Transparency is the
-     layer's alpha resampled smoothly, so silhouettes lose their 8x8
-     staircase; the HD tile stays indexable: the runtime still applies the
-     live CGRAM, fades and colour math.
-  4. Write <out>/tiles.bin (the format runner/dkc1_hd.c reads) and
-     <out>/pack.json.
+  3. Cut each tile's centre back out, undo its on-screen flips, and fit
+     every HD pixel as a blend of two of the palette entries the character
+     itself uses (index i blended toward j by a weight), or, on a soft
+     edge, as one entry blended toward whatever lies below. Transparency is
+     the layer's alpha resampled smoothly, so silhouettes lose their 8x8
+     staircase. The tile stays palette-relative: the runtime still applies
+     the live CGRAM, fades and colour math, and blends between the two
+     colours, so gradients and edges need no dithering.
+  4. Write <out>/tiles.bin (4x) and <out>/tiles-2x.bin (2x, resampled from
+     the same model output; the Switch loads it), in the format
+     runner/dkc1_hd.c reads, and <out>/pack.json.
 
 The dump and the pack contain graphics derived from the user's own ROM.
 Keep both outside the repository and do not redistribute them; distribute
@@ -43,7 +46,7 @@ from PIL import Image
 SUPPORTED_ROM_SHA256 = (
     "fa8cacf5bbfc39ee6bbaa557adf89133d60d42f6cf9e1db30d5a36a469f74d15")
 DUMP_MAGIC = b"DKC1HDD1"
-PACK_MAGIC = b"DKC1HDP1"
+PACK_MAGIC = b"DKC1HDP2"
 RING = 16
 CROP = 8 + 2 * RING
 PAD = 8
@@ -169,20 +172,6 @@ def decode_char(raw: np.ndarray, depth: int) -> np.ndarray:
     return out
 
 
-def srgb_to_oklab(rgb: np.ndarray) -> np.ndarray:
-    c = rgb.astype(np.float32) / 255.0
-    c = np.where(c <= 0.04045, c / 12.92, ((c + 0.055) / 1.055) ** 2.4)
-    lms = c @ np.array([[0.4122214708, 0.2119034982, 0.0883024619],
-                        [0.5363325363, 0.6806995451, 0.2817188376],
-                        [0.0514459929, 0.1073969566, 0.6299787005]],
-                       np.float32)
-    lms = np.cbrt(lms)
-    return lms @ np.array([[0.2104542553, 1.9779984951, 0.0259040371],
-                           [0.7936177850, -2.4285922050, 0.7827717662],
-                           [-0.0040720468, 0.4505937099, -0.8086757660]],
-                          np.float32)
-
-
 def verify_rom(path: Path) -> str:
     data = path.read_bytes()
     if len(data) % 0x8000 == 512:
@@ -225,20 +214,17 @@ def upscale_sheets(records: list[Record], upscaler: Path, model: str,
     return centres
 
 
-BAYER4 = (np.array([[0, 8, 2, 10], [12, 4, 14, 6], [3, 11, 1, 9],
-                    [15, 7, 13, 5]], np.float32) + 0.5) / 16.0
+def hd_alpha(record: Record, native: np.ndarray, scale: int) -> np.ndarray:
+    """Coverage (0-1) of every HD pixel, in the stored character's
+    orientation.
 
-
-def hd_mask(record: Record, native: np.ndarray, scale: int) -> np.ndarray:
-    """Opaque HD pixels, in the stored character's orientation.
-
-    With layer-isolated context the silhouette is resampled smoothly from the
-    layer's alpha around the tile, so edges and diagonals lose their 8x8
+    With layer-isolated context the silhouette is resampled smoothly from
+    the layer's alpha around the tile, so edges and diagonals lose their 8x8
     staircase and may grow into the tile's transparent texels; the runtime
-    fills shrunk pixels from the layer beneath and draws grown ones over it.
-    Composed-frame fallbacks keep the native silhouette."""
+    blends partly covered pixels with the layer beneath. Composed-frame
+    fallbacks keep the native silhouette."""
     if not record.layer_context:
-        return np.kron(native != 0, np.ones((scale, scale), bool))
+        return np.kron(native != 0, np.ones((scale, scale))).astype(np.float32)
     # Inside its own cell only the character's silhouette counts: the OBJ
     # layer can stack other sprites there. The ring keeps edges continuous.
     alpha = record.alpha.copy()
@@ -251,87 +237,115 @@ def hd_mask(record: Record, native: np.ndarray, scale: int) -> np.ndarray:
     big = Image.fromarray(alpha).resize((CROP * scale, CROP * scale),
                                         Image.LANCZOS)
     lo = RING * scale
-    mask = np.asarray(big)[lo:lo + 8 * scale, lo:lo + 8 * scale] >= 128
+    cover = np.asarray(big, np.float32)[lo:lo + 8 * scale,
+                                         lo:lo + 8 * scale] / 255.0
     if record.hflip:
-        mask = mask[:, ::-1]
+        cover = cover[:, ::-1]
     if record.vflip:
-        mask = mask[::-1, :]
-    return mask
+        cover = cover[::-1, :]
+    return np.clip(cover, 0.0, 1.0)
 
 
-def quantize_tile(record: Record, centre: np.ndarray, scale: int,
-                  dither: float, detail: float, palette: str) -> np.ndarray:
-    """Palette-relative HD tile in the stored character's orientation."""
+def fit_blends(pixels: np.ndarray, colors: np.ndarray):
+    """Best (a, b, t) per pixel: colors[a] blended toward colors[b] by t.
+
+    The runtime blends the 5-bit palette colours linearly, so the fit is
+    done in the same (sRGB) space."""
+    k = len(colors)
+    a_idx, b_idx = np.triu_indices(k)  # pairs, including a == b
+    ca = colors[a_idx]                  # (P, 3)
+    d = colors[b_idx] - ca              # (P, 3)
+    dd = (d * d).sum(axis=1)            # (P,)
+    rel = pixels[:, None, :] - ca[None]  # (N, P, 3)
+    t = np.where(dd > 0, (rel * d[None]).sum(axis=2) / np.maximum(dd, 1e-9),
+                 0.0)
+    t = np.clip(t, 0.0, 1.0)
+    err = ((rel - t[..., None] * d[None]) ** 2).sum(axis=2)
+    best = err.argmin(axis=1)
+    rows = np.arange(len(pixels))
+    return a_idx[best], b_idx[best], t[rows, best]
+
+
+def blend_tile(record: Record, centre: np.ndarray, scale: int,
+               detail: float, palette: str) -> np.ndarray:
+    """v2 HD tile: (8*scale)^2 uint16 texels, (i << 4 | j) | w << 8, in the
+    stored character's orientation (see runner/dkc1_hd.c)."""
+    centre = centre.astype(np.float32)
     if detail > 0:
-        # Mix back some of the original CGI grain: a smooth upscale hides
-        # the texture that, natively, masks the edges between 8x8 tiles.
+        # Optionally mix back some of the original pixel grain.
         lo = record.crop[RING:RING + 8, RING:RING + 8].astype(np.float32)
         grain = np.kron(lo, np.ones((4, 4, 1), np.float32))
-        centre = np.clip(centre.astype(np.float32) * (1 - detail) +
-                         grain * detail + 0.5, 0, 255).astype(np.uint8)
+        centre = centre * (1 - detail) + grain * detail
     if scale != 4:
-        centre = np.asarray(Image.fromarray(centre).resize(
-            (8 * scale, 8 * scale), Image.LANCZOS))
+        # Area-average the 4x model output down: no aliasing.
+        f = 4 // scale
+        centre = centre.reshape(8 * scale, f, 8 * scale, f, 3).mean(axis=(1, 3))
     if record.hflip:
         centre = centre[:, ::-1]
     if record.vflip:
         centre = centre[::-1, :]
     native = decode_char(record.raw, record.depth)
     if palette == "row":
-        # Every opaque entry of the palette row the tile was seen with.
-        colors = 4 if record.depth == DEPTH_2BPP else 16
+        colors_n = 4 if record.depth == DEPTH_2BPP else 16
         used, seen = [], set()
-        for index in range(1, colors):
+        for index in range(1, colors_n):
             rgb = tuple(record.palette[index])
             if rgb not in seen:
                 seen.add(rgb)
                 used.append(index)
-        used = np.array(used, np.uint8)
+        used = np.array(used, np.int64)
     else:
         # Only indices the character itself uses: the same character can be
         # shown with other palette rows, whose other entries are unrelated.
-        used = np.unique(native[native != 0])
-    mask = hd_mask(record, native, scale)
-    tile = np.zeros((8 * scale, 8 * scale), np.uint8)
+        used = np.unique(native[native != 0]).astype(np.int64)
+    size = 8 * scale
+    tile = np.zeros((size, size), np.uint16)
     if used.size == 0:
         return tile
-    choices = srgb_to_oklab(record.palette[used])
-    pixels = srgb_to_oklab(centre.reshape(-1, 3))
-    if dither and used.size > 1:
-        # Ordered dithering keeps the average tone of DKC's own dithered
-        # shading. The threshold depends only on the HD pixel position, so
-        # neighbouring tiles dither coherently across their shared edge.
-        gaps = np.sqrt(((choices[:, None] - choices[None]) ** 2).sum(axis=2))
-        gaps[gaps == 0] = np.inf
-        spread = float(np.median(gaps.min(axis=1)))
-        size = 8 * scale
-        threshold = np.tile(BAYER4, (size // 4, size // 4)).reshape(-1)
-        pixels = pixels.copy()
-        pixels[:, 0] += (threshold - 0.5) * spread * dither
-    nearest = np.argmin(((pixels[:, None, :] - choices[None, :, :]) ** 2)
-                        .sum(axis=2), axis=1)
-    tile[:] = used[nearest].reshape(8 * scale, 8 * scale)
-    tile[~mask] = 0
-    return tile
+    cover = hd_alpha(record, native, scale).reshape(-1)
+    pixels = centre.reshape(-1, 3)
+    colors = record.palette[used].astype(np.float32)
+    a, b, t = fit_blends(pixels, colors)
+    i = used[a]
+    j = used[b]
+    w = np.rint(t * 255).astype(np.int64)
+    # Soft edges: the nearest single colour, blended toward what lies
+    # below (index 0) by the missing coverage.
+    nearest = ((pixels[:, None, :] - colors[None]) ** 2).sum(axis=2).argmin(1)
+    edge = (cover > 0.02) & (cover < 0.98)
+    i = np.where(edge, used[nearest], i)
+    j = np.where(edge, 0, j)
+    w = np.where(edge, np.rint((1.0 - cover) * 255).astype(np.int64), w)
+    empty = cover <= 0.02
+    i = np.where(empty, 0, i)
+    j = np.where(empty, 0, j)
+    w = np.where(empty, 0, w)
+    texels = (i << 4 | j) | (w << 8)
+    return texels.reshape(size, size).astype(np.uint16)
 
 
 def write_pack(out: Path, tiles: dict[int, np.ndarray], scale: int,
-               digest: str, meta: dict) -> None:
+               digest: str, meta: dict, name: str = "tiles.bin") -> None:
     out.mkdir(parents=True, exist_ok=True)
     keys = sorted(tiles)
-    tile_bytes = (8 * scale) ** 2
+    tile_bytes = (8 * scale) ** 2 * 2
     data_start = 64 + 16 * len(keys)
-    header = (PACK_MAGIC + struct.pack("<IIII", 1, scale, len(keys), 0) +
+    header = (PACK_MAGIC + struct.pack("<IIII", 2, scale, len(keys), 0) +
               bytes.fromhex(digest) + bytes(8))
-    with (out / "tiles.bin").open("wb") as stream:
+    with (out / name).open("wb") as stream:
         stream.write(header)
         for i, key in enumerate(keys):
             stream.write(struct.pack("<QII", key, data_start + i * tile_bytes, 0))
         for key in keys:
-            stream.write(tiles[key].tobytes())
-    meta = dict(meta, schema="dkc1.hd-pack.v1", rom_sha256=digest,
-                scale=scale, tiles=len(keys))
-    (out / "pack.json").write_text(json.dumps(meta, indent=2) + "\n")
+            stream.write(tiles[key].astype("<u2").tobytes())
+    meta = dict(meta, schema="dkc1.hd-pack.v2", rom_sha256=digest,
+                tiles=len(keys))
+    meta.setdefault("files", {})[name] = scale
+    pack_json = out / "pack.json"
+    if pack_json.exists():
+        old = json.loads(pack_json.read_text())
+        meta["files"] = dict(old.get("files", {}), **meta["files"])
+    pack_json.write_text(json.dumps(meta, indent=2) + "\n")
 
 
 def main() -> int:
@@ -348,15 +362,17 @@ def main() -> int:
                         help="realesrgan-ncnn-vulkan executable")
     parser.add_argument("--model", default="realesr-animevideov3",
                         help="model name in the upscaler's models/ folder")
-    parser.add_argument("--scale", type=int, default=4, choices=(2, 3, 4))
+    parser.add_argument("--scales", default="4,2",
+                        help="comma-separated pack scales to write: 4 goes "
+                             "to tiles.bin, 2 to tiles-2x.bin, 1 to "
+                             "tiles-1x.bin")
     parser.add_argument("--name", default="DKC1 HD Remaster")
     parser.add_argument("--palette", choices=("used", "row"), default="used",
                         help="quantize to the indices the tile uses, or to "
                              "its whole palette row")
-    parser.add_argument("--detail", type=float, default=0.35,
-                        help="share of the original pixel grain mixed back")
-    parser.add_argument("--dither", type=float, default=0.7,
-                        help="ordered dithering strength (0 = nearest colour)")
+    parser.add_argument("--detail", type=float, default=0.0,
+                        help="share of the original (blocky) pixel grain "
+                             "mixed back into the upscale")
     parser.add_argument("--sheet", type=int, default=36,
                         help="tiles per sheet row (sheet = N x N tiles)")
     parser.add_argument("--limit", type=int, default=0,
@@ -371,17 +387,24 @@ def main() -> int:
     args = parser.parse_args()
 
     digest = verify_rom(args.rom)
+    scales = sorted({int(v) for v in args.scales.split(",")}, reverse=True)
+    if any(v not in (1, 2, 4) for v in scales):
+        raise SystemExit("--scales: each scale must be 1, 2 or 4")
+    def file_for(scale: int) -> str:
+        return "tiles.bin" if scale == 4 else f"tiles-{scale}x.bin"
     records = merge_dumps(args.dump)
     if args.identity:
-        # Regression pack: every HD texel is its native texel. The runtime
-        # must then reproduce the native frame exactly (tools/hd_seams.py
-        # --exact checks it).
-        tiles = {r.key: np.kron(decode_char(r.raw, r.depth),
-                                np.ones((args.scale, args.scale), np.uint8))
-                 for r in records}
-        write_pack(args.out, tiles, args.scale, digest,
-                   {"name": "identity (regression)"})
-        print(f"wrote {len(tiles)} identity tiles to {args.out}")
+        # Regression pack: every HD texel is its native texel (i = native
+        # index, no blend). The runtime must then reproduce the native frame
+        # exactly (tools/hd_seams.py --exact checks it).
+        for scale in scales:
+            tiles = {r.key: np.kron(decode_char(r.raw, r.depth).astype(
+                                        np.uint16) << 4,
+                                    np.ones((scale, scale), np.uint16))
+                     for r in records}
+            write_pack(args.out, tiles, scale, digest,
+                       {"name": "identity (regression)"}, file_for(scale))
+        print(f"wrote {len(records)} identity tiles to {args.out}")
         return 0
     if args.limit:
         records = sorted(records, key=lambda r: -r.count)[:args.limit]
@@ -405,25 +428,31 @@ def main() -> int:
             if args.cache:
                 np.savez(args.cache, keys=keys, model=args.model,
                          centres=np.stack(centres))
-        tiles = {r.key: quantize_tile(r, c, args.scale, args.dither,
-                                      args.detail, args.palette)
-                 for r, c in zip(records, centres)}
+        packs = {scale: {r.key: blend_tile(r, c, scale, args.detail,
+                                           args.palette)
+                         for r, c in zip(records, centres)}
+                 for scale in scales}
     finally:
         if args.keep_work:
             print(f"work files kept in {work}")
         else:
             shutil.rmtree(work, ignore_errors=True)
-    write_pack(args.out, tiles, args.scale, digest, {
-        "name": args.name,
-        "generator": {"tool": "tools/hd_pack.py", "upscaler": "Real-ESRGAN "
-                      "ncnn-vulkan", "model": args.model,
-                      "quantize": "OKLab nearest, used indices, Bayer 4x4 "
-                                  f"dither {args.dither}",
-                      "detail": args.detail,
-                      "alpha": "Lanczos-resampled layer alpha (native "
-                               "silhouette for frame-context tiles)"},
-    })
-    print(f"wrote {len(tiles)} tiles at {args.scale}x to {args.out}")
+    for scale, tiles in packs.items():
+        write_pack(args.out, tiles, scale, digest, {
+            "name": args.name,
+            "generator": {"tool": "tools/hd_pack.py", "upscaler": "Real-ESRGAN "
+                          "ncnn-vulkan", "model": args.model,
+                          "fit": "two palette entries and a blend weight per "
+                                 "HD pixel, " + args.palette + " indices",
+                          "detail": args.detail,
+                          "alpha": "Lanczos-resampled layer alpha, soft "
+                                   "edges blend with the layer below "
+                                   "(native silhouette for frame-context "
+                                   "tiles)",
+                          "downscale": "area average of the 4x output"},
+        }, file_for(scale))
+        print(f"wrote {len(tiles)} tiles at {scale}x to "
+              f"{args.out / file_for(scale)}")
     return 0
 
 

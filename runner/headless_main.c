@@ -20,6 +20,7 @@
 #include "snes/snes.h"
 
 #include <stdio.h>
+#include <time.h>
 #include <stdlib.h>
 #include <string.h>
 #ifdef _WIN32
@@ -34,6 +35,32 @@
 
 static void PrintHash(FILE *stream, const uint8_t hash[32]) {
   for (int i = 0; i < 32; i++) fprintf(stream, "%02x", hash[i]);
+}
+
+/* DKC1_HD_GPU_HASH=1 (with DKC1_HD_GPU_ENCODE): running FNV-1a over every
+ * frame's GPU compositor inputs (G-buffers and line table). The encode must
+ * not depend on how it is split across threads. */
+static uint64_t s_gpu_inputs_hash = 0xcbf29ce484222325ull;
+
+static void HashBytes(const void *data, size_t size) {
+  const uint8_t *p = data;
+  for (size_t i = 0; i < size; i++)
+    s_gpu_inputs_hash = (s_gpu_inputs_hash ^ p[i]) * 0x100000001b3ull;
+}
+
+static void HashGpuInputs(void) {
+  static int enabled = -1;
+  if (enabled < 0) {
+    const char *v = getenv("DKC1_HD_GPU_HASH");
+    enabled = v && *v && *v != '0';
+  }
+  const Dkc1HdGpuInputs *in = enabled ? Dkc1HdGpuFrame() : NULL;
+  if (!in)
+    return;
+  const size_t texels = (size_t)in->width * in->height * 4;
+  HashBytes(in->g, texels * sizeof *in->g);
+  HashBytes(in->lines,
+            (size_t)kDkc1HdGpuLineStride * in->height * sizeof *in->lines);
 }
 
 static uint16_t ReadWram16(size_t address) {
@@ -134,6 +161,13 @@ int main(int argc, char **argv) {
   }
   Dkc1VideoSetRom(rom, rom_size);
   RtlRegisterGame(Dkc1GameInfo());
+  /* DKC1_HD_GPU_ENCODE=1: run the CPU side of GPU composition only (capture
+   * and G-buffer encoding) to measure what a GPU host still pays. */
+  {
+    const char *encode = getenv("DKC1_HD_GPU_ENCODE");
+    if (encode && *encode && *encode != '0')
+      Dkc1HdSetGpuComposition(true);
+  }
   if (!SnesInit(rom, (int)rom_size)) {
     fprintf(stderr, "snesrecomp rejected the verified ROM\n");
     free(rom);
@@ -256,9 +290,19 @@ int main(int argc, char **argv) {
     return 18;
   }
 
-  enum { kMaximumAudioFramesPerVideoFrame = 534 };
+  /* DKC1_AUDIO_RATE=<Hz> renders at a device rate other than the native
+   * 32040 Hz (e.g. 48000, as on Switch) to exercise rate conversion. */
+  enum { kMaximumAudioFramesPerVideoFrame = 3200 };
   int16_t audio[kMaximumAudioFramesPerVideoFrame * 2];
-  const double audio_frames_per_video_frame = 32040.0 / 60.098811862;
+  double audio_rate = 32040.0;
+  {
+    const char *rate = getenv("DKC1_AUDIO_RATE");
+    if (rate && *rate && atoi(rate) >= 8000 && atoi(rate) <= 192000) {
+      audio_rate = atoi(rate);
+      RtlSetAudioOutputRate(atoi(rate));
+    }
+  }
+  const double audio_frames_per_video_frame = audio_rate / 60.098811862;
   double audio_frame_accumulator = 0.0;
   unsigned long long audio_rendered_frames = 0;
   uint64_t audio_fnv1a = UINT64_C(14695981039346656037);
@@ -420,7 +464,28 @@ int main(int argc, char **argv) {
       script_ops.run_frame = true;
     }
     Dkc1DebugRecordInput(_in);
-    RtlRunFrame(_in);
+    {
+      /* DKC1_FRAME_TIMES=<path>: one line per frame with the wall time of
+       * RtlRunFrame in microseconds (performance work). */
+      static FILE *frame_times;
+      static int frame_times_init;
+      if (!frame_times_init) {
+        frame_times_init = 1;
+        const char *path = getenv("DKC1_FRAME_TIMES");
+        if (path && *path)
+          frame_times = fopen(path, "w");
+      }
+      struct timespec t0, t1;
+      if (frame_times)
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+      RtlRunFrame(_in);
+      if (frame_times) {
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        fprintf(frame_times, "%ld %.1f\n", frame,
+                (t1.tv_sec - t0.tv_sec) * 1e6 +
+                    (t1.tv_nsec - t0.tv_nsec) / 1e3);
+      }
+    }
     if (g_fail) {
       fprintf(stderr,
               "snesrecomp reported an off-rails runtime failure at host "
@@ -450,6 +515,7 @@ int main(int argc, char **argv) {
       return 5;
     }
     Dkc1DrawPpuFrame();
+    HashGpuInputs();
     Dkc1BlankScanFrame(frame + 1, pixels, Dkc1VideoWidth(),
                        kDkc1VideoHeight, Dkc1VideoTerrainReady());
     Dkc1InvariantMonitorFrame(frame + 1);
@@ -749,7 +815,7 @@ int main(int argc, char **argv) {
            "sub_identity=%llu ref_mismatch=%llu equiv_mismatch=%llu "
            "pack_hits=%llu pack_misses=%llu under_checked=%llu "
            "under_mismatch=%llu cover_checked=%llu cover_mismatch=%llu "
-           "compose_ms_per_frame=%.3f",
+           "compose_ms_per_frame=%.3f gpu_inputs_fnv1a=%016llx",
            Dkc1HdStatus(), (unsigned long long)hd.frames,
            (unsigned long long)hd.pixels, (unsigned long long)hd.uncomposed,
            (unsigned long long)hd.black,
@@ -764,7 +830,8 @@ int main(int argc, char **argv) {
            (unsigned long long)hd.under_mismatch,
            (unsigned long long)hd.cover_checked,
            (unsigned long long)hd.cover_mismatch,
-           hd.frames ? hd.compose_ns / 1e6 / (double)hd.frames : 0.0);
+           hd.frames ? hd.compose_ns / 1e6 / (double)hd.frames : 0.0,
+           (unsigned long long)s_gpu_inputs_hash);
     const char *hd_output = getenv("DKC1_HD_PPM");
     if (hd_output && *hd_output && !Dkc1HdWritePpm(hd_output))
       fprintf(stderr, "could not write %s\n", hd_output);

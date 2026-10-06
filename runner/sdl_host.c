@@ -7,6 +7,12 @@
 #include "dkc1_blank_scan.h"
 #include "dkc1_baby_kong.h"
 #include "dkc1_hd.h"
+#include "dkc1_hd_gpu.h"
+#ifdef __SWITCH__
+#include "dkc1_overlay_menu.h"
+#include "switch_audio.h"
+#include "switch_clock.h"
+#endif
 #include "dkc1_debug_dump.h"
 #include "dkc1_flight_recorder.h"
 #include "dkc1_game.h"
@@ -75,11 +81,20 @@
 enum {
   kSnesPixelAspectNumerator = 7,
   kSnesPixelAspectDenominator = 6,
+#ifdef __SWITCH__
+  /* audren runs at 48 kHz: let the engine's resampler produce the device
+   * rate directly instead of adding SDL's converter on a slow CPU. */
+  kAudioRate = 48000,
+#else
   kAudioRate = 32040,
+#endif
   kAudioChannels = 2,
   kAudioScratchFrames = 1024,
+  /* Engine ring thresholds, in native S-DSP frames (32 kHz). */
   kAudioFramesPerBlock = 536,
   kAudioRingStartFrames = 2136,
+  /* Host device queue, in device frames: one 60 Hz block at kAudioRate. */
+  kAudioDeviceFramesPerBlock = kAudioRate / 60 + 2,
   kAudioMaximumQueuedFrames = kAudioRate / 4,
 };
 
@@ -173,6 +188,15 @@ static uint8_t s_pixels[kDkc1VideoWidescreenWidth * kDkc1VideoHeight * 4];
 static SDL_Window *s_window;
 static SDL_Renderer *s_renderer;
 static SDL_Texture *s_texture;
+#ifdef __SWITCH__
+/* Switch presents through OpenGL (core 3.3 or GLES 3) when available, so
+ * HD frames are composed on the GPU (dkc1_hd_gpu.c); SDL_Renderer remains
+ * the fallback. */
+static SDL_GLContext s_switch_gl;
+/* The GL swap waits for the display's vblank, which then paces frames
+ * instead of the host clock (see SwitchTrackFrameRate). */
+static bool s_switch_vsync;
+#endif
 /* HD texture surface for the SDL renderer path (Switch). */
 static SDL_Texture *s_hd_texture;
 static int s_hd_texture_width, s_hd_texture_height;
@@ -199,7 +223,12 @@ static Dkc1Msu1 *s_msu1;
 static Dkc1StompProbe s_stomp_probe;
 static int16_t s_audio_scratch[kAudioScratchFrames * kAudioChannels];
 static double s_audio_accumulator;
+#ifdef __SWITCH__
+/* A deeper device cushion absorbs Horizon scheduling and SD-card jitter. */
+static unsigned s_audio_preroll_blocks = 4;
+#else
 static unsigned s_audio_preroll_blocks = 2;
+#endif
 static unsigned s_audio_ring_start_threshold = kAudioRingStartFrames;
 static unsigned s_audio_last_queued_frames;
 static unsigned s_audio_ring_frames;
@@ -220,6 +249,35 @@ static Dkc1GraphicsSettings s_graphics;
 static Dkc1DesktopColorFilter s_color_filter;
 static uint8_t s_display_pixels[kDkc1VideoWidescreenWidth * kDkc1VideoHeight * 4];
 static int s_input_release_gate;
+#ifdef __SWITCH__
+/* In-game menu (dkc1_overlay_menu.c): opened with Plus + Minus or by
+ * clicking the right stick; it pauses emulation while open. */
+static const char kSwitchMenuConfig[] = "menu.cfg";
+static const char kSwitchCheatFile[] = "cheats.txt";
+static Dkc1MenuSettings s_menu;
+static Dkc1Cheat s_cheats[kDkc1MenuMaxCheats];
+static int s_cheat_count;
+static uint32_t s_overlay[kDkc1VideoWidescreenWidth * kDkc1VideoHeight];
+static bool s_overlay_live;
+static char s_menu_message[40];
+static uint32_t s_menu_buttons;
+/* HD stage times for the [hd-perf] line (perf HUD on): PPU frame with
+ * capture and encode, GL upload + pass submission, and (with gpu.flag in
+ * the app folder) the GPU's own time measured through glFinish. */
+static struct {
+  double draw, submit, gpu;
+  bool gpu_finish;
+} s_hd_perf;
+/* Frame-time figures for the HUD, refreshed once a second. */
+static struct {
+  double work, emulation, render, audio, worst;
+  int frames, slow;
+  bool warn;  /* the last second had slow frames or audio gaps */
+  char text[64];
+} s_perf;
+static void SwitchMenuOpen(void);
+static void PollEvents(void);
+#endif
 static void OpenPauseMenu(int graphics_page);
 
 static int s_width;
@@ -758,7 +816,17 @@ static void FramePacerAdvance(Dkc1FramePacer *pacer, double presented_at,
   const double lateness = presented_at - pacer->next_deadline;
   if (lateness >= pacer->ticks_per_frame * 3.0 && s_audio_started)
     s_audio_recovery_requested = 1;
-  if (force_reanchor || lateness > pacer->frequency / 500.0)
+#ifdef __SWITCH__
+  /* Keep a fixed 60 Hz cadence: a frame up to three frames late is made up
+   * by the following ones instead of moving the schedule. Re-anchoring on
+   * every 2 ms of lateness (as below) lost that time for good each time a GL
+   * swap took a few milliseconds, which ran the loop at 58.6-58.9 Hz and
+   * left the audio short every second. */
+  const double late_limit = pacer->ticks_per_frame * 3.0;
+#else
+  const double late_limit = pacer->frequency / 500.0;
+#endif
+  if (force_reanchor || lateness > late_limit)
     FramePacerReanchor(pacer, presented_at);
   else
     pacer->next_deadline += pacer->ticks_per_frame;
@@ -867,6 +935,10 @@ static void UpdateTitle(void) {
 static char *ConfiguredMusicPackPath(void) {
   if (EnvironmentEnabled("DKC1_MSU1_DISABLE"))
     return NULL;
+#ifdef __SWITCH__
+  if (!s_menu.msu1)
+    return NULL;
+#endif
   const char *configured = getenv("DKC1_MSU1_PACK");
   if (configured && *configured) {
     size_t size = strlen(configured) + 1;
@@ -984,6 +1056,8 @@ static void ApplyPresentationGeometry(void) {
   return; /* OpenGL fits the live drawable each frame, preserving SNES PAR. */
 #endif
 #ifdef __SWITCH__
+  if (s_switch_gl)
+    return;  /* the GL presenter fits every frame itself */
   /* Edge-to-edge handheld picture: no logical size, no integer scale,
    * full viewport, linear sampling for the fractional stretch. Without
    * this the integer scaler fits 399x224 into 1197x672 and centers it,
@@ -1054,6 +1128,41 @@ static bool InitVideo(void) {
     }
     (void)window_width;
     (void)window_height;
+    static const struct { int profile, major, minor; bool gles; } kTries[] = {
+      {SDL_GL_CONTEXT_PROFILE_CORE, 3, 3, false},
+      {SDL_GL_CONTEXT_PROFILE_ES, 3, 0, true},
+    };
+    for (size_t i = 0; i < sizeof kTries / sizeof kTries[0] && !s_switch_gl;
+         i++) {
+      SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, kTries[i].profile);
+      SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, kTries[i].major);
+      SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, kTries[i].minor);
+      s_window = SDL_CreateWindow("DKC1Recomp", 0, 0, switch_w, switch_h,
+                                  SDL_WINDOW_OPENGL);
+      if (!s_window)
+        continue;
+      s_switch_gl = SDL_GL_CreateContext(s_window);
+      if (s_switch_gl && SDL_GL_MakeCurrent(s_window, s_switch_gl) == 0 &&
+          Dkc1HdGpuInit(kTries[i].gles)) {
+        /* The host clock paces frames (FramePacerAdvance keeps a fixed
+         * cadence on Switch). Vblank pacing was tried: the GL driver then
+         * blocks the texture upload for most of a frame and regularly
+         * misses a vblank, so the loop ran near 57 Hz. */
+        SDL_GL_SetSwapInterval(0);
+        s_switch_vsync = false;
+        Dkc1HdSetGpuComposition(true);
+        fprintf(stderr, "[switch] OpenGL presenter (%s)\n",
+                kTries[i].gles ? "GLES 3.0" : "GL 3.3 core");
+        return true;
+      }
+      fprintf(stderr, "[switch] %s unavailable: %s\n",
+              kTries[i].gles ? "GLES 3.0" : "GL 3.3", SDL_GetError());
+      if (s_switch_gl)
+        SDL_GL_DeleteContext(s_switch_gl);
+      s_switch_gl = NULL;
+      SDL_DestroyWindow(s_window);
+      s_window = NULL;
+    }
     s_window = SDL_CreateWindow("DKC1Recomp", 0, 0, switch_w, switch_h, 0);
   }
 #else
@@ -1188,7 +1297,67 @@ static void InitDisplayLink(void) {
 /* Present dkc1_hd.c's surface instead of the native frame. Same fit as the
  * native picture (PresentationWidth() x kDkc1VideoHeight); the color filter,
  * Reconstruct and CRT apply to native pixels only. */
+#if defined(_WIN32)
+/* DKC1_HD_GPU_VERIFY=1: compare every GPU-composed frame with the CPU
+ * composition of the same frame (dkc1_hd.c keeps both in that mode). */
+static void VerifyGpuComposition(void) {
+  static int checked = -1;
+  static long frames, frames_differ;
+  static uint64_t pixels_differ;
+  if (checked < 0) {
+    const char *v = getenv("DKC1_HD_GPU_VERIFY");
+    checked = v && *v && *v != '0';
+  }
+  if (!checked)
+    return;
+  int cw, ch, gw, gh;
+  const uint32_t *cpu = Dkc1HdOutput(&cw, &ch, NULL);
+  static uint32_t *gpu;
+  static size_t capacity;
+  if (!cpu || (size_t)cw * ch > capacity) {
+    if (!cpu)
+      return;
+    free(gpu);
+    capacity = (size_t)cw * ch;
+    gpu = malloc(capacity * sizeof *gpu);
+  }
+  if (!gpu || !Dkc1HdGpuReadComposite(gpu, &gw, &gh) || gw != cw || gh != ch)
+    return;
+  /* Both sides blend in float; a GPU may fuse a multiply-add and land one
+   * level off after flooring, so allow 1 per channel. */
+  uint64_t differ = 0;
+  for (size_t i = 0; i < (size_t)cw * ch; i++) {
+    int worst = 0;
+    for (int shift = 0; shift < 24; shift += 8) {
+      const int d = (int)((gpu[i] >> shift) & 0xff) -
+                    (int)((cpu[i] >> shift) & 0xff);
+      if (abs(d) > worst) worst = abs(d);
+    }
+    differ += worst > 1;
+  }
+  frames++;
+  frames_differ += differ != 0;
+  pixels_differ += differ;
+  if (frames % 120 == 0 || differ)
+    fprintf(stderr, "[hd-gpu-verify] frames=%ld frames_differ=%ld "
+            "pixels_differ=%llu (last %llu of %dx%d)\n", frames,
+            frames_differ, (unsigned long long)pixels_differ,
+            (unsigned long long)differ, cw, ch);
+}
+#endif
+
 static bool PrepareHdPresentation(void) {
+#if defined(_WIN32)
+  const Dkc1HdGpuInputs *gpu = Dkc1HdGpuFrame();
+  if (gpu) {
+    if (Dkc1WindowsGraphicsDrawHdGpu(gpu, PresentationWidth(),
+                                     kDkc1VideoHeight)) {
+      VerifyGpuComposition();
+      return true;
+    }
+    return false;
+  }
+#endif
   int hd_width, hd_height;
   const uint32_t *hd = Dkc1HdOutput(&hd_width, &hd_height, NULL);
   if (!hd)
@@ -1253,12 +1422,68 @@ static bool PrepareHdPresentation(void) {
   return true;
 }
 
+#ifdef __SWITCH__
+/* GL presenter: the picture keeps its presentation aspect inside the
+ * current drawable (1080p docked, 720p handheld). */
+static void SwitchGlPresent(void) {
+  int ow = 0, oh = 0;
+  SDL_GL_GetDrawableSize(s_window, &ow, &oh);
+  if (ow < 1 || oh < 1)
+    return;
+  const int pw = PresentationWidth();
+  int vw = ow, vh = (int)((int64_t)ow * kDkc1VideoHeight / pw);
+  if (vh > oh) {
+    vh = oh;
+    vw = (int)((int64_t)oh * pw / kDkc1VideoHeight);
+  }
+  const int vx = (ow - vw) / 2, vy = (oh - vh) / 2;
+  const Dkc1HdGpuInputs *gpu = Dkc1HdGpuFrame();
+  int hd_width, hd_height;
+  const uint32_t *hd;
+  const double t0 = FramePacerNow();
+  const bool composed = gpu && Dkc1HdGpuCompose(gpu);
+  const double t1 = FramePacerNow();
+  if (composed && s_hd_perf.gpu_finish) {
+    Dkc1HdGpuFinish();  /* diagnostics only: serializes CPU and GPU */
+    s_hd_perf.gpu += FramePacerNow() - t1;
+  }
+  s_hd_perf.submit += t1 - t0;
+  if (composed)
+    Dkc1HdGpuPresent(0, vx, vy, vw, vh);
+  else if ((hd = Dkc1HdOutput(&hd_width, &hd_height, NULL)) != NULL)
+    Dkc1HdGpuPresentNative(hd, hd_width, hd_height, (size_t)hd_width, 0, vx,
+                           vy, vw, vh);
+  else
+    Dkc1HdGpuPresentNative((const uint32_t *)s_pixels, s_width,
+                           kDkc1VideoHeight, (size_t)s_width, 0, vx, vy, vw,
+                           vh);
+  if (s_overlay_live)
+    Dkc1HdGpuPresentOverlay(s_overlay, s_width, kDkc1VideoHeight,
+                            (size_t)s_width, 0, vx, vy, vw, vh);
+}
+#endif
+
 static void PreparePresentation(void) {
+#ifdef __SWITCH__
+  if (s_switch_gl) {
+    SwitchGlPresent();
+    return;
+  }
+#endif
   if (PrepareHdPresentation())
     return;
   const uint8_t *display=Dkc1DesktopColorFilterApply(&s_color_filter,s_pixels,
       s_display_pixels,(size_t)s_width*kDkc1VideoHeight);
   if (!display) display=s_pixels;
+#ifdef __SWITCH__
+  if (s_overlay_live) {
+    if (display != s_display_pixels)
+      memcpy(s_display_pixels, display, (size_t)s_width * kDkc1VideoHeight * 4);
+    Dkc1MenuBlend((uint32_t *)s_display_pixels, (size_t)s_width, s_overlay,
+                  (size_t)s_width, s_width, kDkc1VideoHeight);
+    display = s_display_pixels;
+  }
+#endif
 #ifdef _WIN32
   Dkc1WindowsGraphicsDraw((const uint32_t *)display,s_width,kDkc1VideoHeight,
                          PresentationWidth(),&s_graphics);
@@ -1315,6 +1540,12 @@ static void SubmitPresentation(void) {
 #ifdef _WIN32
   Dkc1WindowsGraphicsSwap();
   return;
+#endif
+#ifdef __SWITCH__
+  if (s_switch_gl) {
+    SDL_GL_SwapWindow(s_window);
+    return;
+  }
 #endif
   if (!s_metal_presenter_active)
     SDL_RenderPresent(s_renderer);
@@ -1558,6 +1789,97 @@ static uint32_t PollInput(void) {
   return result;
 }
 
+/* Device pause and queue depth, on SDL or (Switch) the audren feeder. */
+static void AudioPause(int paused) {
+#ifdef __SWITCH__
+  Dkc1SwitchAudioPause(paused != 0);
+#else
+  SDL_PauseAudioDevice(s_audio_device, paused);
+#endif
+}
+
+static Uint32 AudioQueuedBytes(void) {
+#ifdef __SWITCH__
+  return Dkc1SwitchAudioQueuedBytes();
+#else
+  return SDL_GetQueuedAudioSize(s_audio_device);
+#endif
+}
+
+#ifdef __SWITCH__
+/* Audio diagnostics, armed by an `audio_dump.flag` file in the app folder:
+ * 60 s of the mix before the rate servo (audio_render.raw), as queued
+ * (audio_queued.raw) and as played (audio_played.raw), all 16-bit stereo
+ * 48 kHz, plus one stderr line per second (log.flag sends it to
+ * debug.log) with queue depth, servo ratio and every underflow counter. */
+enum { kAudioDiagnosticFrames = kAudioRate * 60 };
+static int s_audio_diag = -1;
+static int16_t *s_audio_render_capture;
+static uint32_t s_audio_render_frames;
+
+static void SwitchAudioDiagnostics(int frames) {
+  if (s_audio_diag < 0) {
+    FILE *flag = fopen("audio_dump.flag", "rb");
+    s_audio_diag = flag != NULL;
+    if (flag) {
+      fclose(flag);
+      s_audio_render_capture = malloc((size_t)kAudioDiagnosticFrames * 4);
+      if (!s_audio_render_capture ||
+          !Dkc1SwitchAudioCaptureStart(kAudioDiagnosticFrames)) {
+        free(s_audio_render_capture);
+        s_audio_render_capture = NULL;
+        s_audio_diag = 0;
+      }
+      fprintf(stderr, "[audio-diag] %s\n",
+              s_audio_diag ? "recording 60 s" : "cannot allocate");
+    }
+  }
+  if (!s_audio_diag)
+    return;
+  if (s_audio_render_capture && s_audio_render_frames < kAudioDiagnosticFrames) {
+    uint32_t n = (uint32_t)frames;
+    if (n > kAudioDiagnosticFrames - s_audio_render_frames)
+      n = kAudioDiagnosticFrames - s_audio_render_frames;
+    memcpy(s_audio_render_capture + (size_t)s_audio_render_frames * 2,
+           s_audio_scratch, (size_t)n * 4);
+    s_audio_render_frames += n;
+    if (s_audio_render_frames == kAudioDiagnosticFrames) {
+      FILE *file = fopen("audio_render.raw", "wb");
+      if (file) {
+        fwrite(s_audio_render_capture, 4, kAudioDiagnosticFrames, file);
+        fclose(file);
+      }
+      free(s_audio_render_capture);
+      s_audio_render_capture = NULL;
+      fprintf(stderr, "[audio-dump] audio_render.raw written\n");
+    }
+  }
+  (void)Dkc1SwitchAudioCaptureDump("audio_queued.raw", "audio_played.raw");
+  static int s_calls;
+  static uint32_t s_min_queue = UINT32_MAX, s_max_queue;
+  const uint32_t queued = s_audio_last_queued_frames;
+  if (queued < s_min_queue) s_min_queue = queued;
+  if (queued > s_max_queue) s_max_queue = queued;
+  if (++s_calls % 60)
+    return;
+  AudioTraceStats stats;
+  audio_trace_get_stats(&stats);
+  fprintf(stderr,
+          "[audio-diag] t=%ds queue=%u..%u target=%.0f ratio=%.5f "
+          "spc_ring=%u spc_underflows=%u feeder_gaps=%u starvations=%lu "
+          "drops=%lu started=%d\n",
+          s_calls / 60, (unsigned)s_min_queue, (unsigned)s_max_queue,
+          s_audio_target_frames, s_audio_ratio,
+          (unsigned)stats.occupancy_current,
+          (unsigned)stats.output_underflows,
+          (unsigned)Dkc1SwitchAudioUnderruns(),
+          (unsigned long)s_audio_starvations, (unsigned long)s_audio_drops,
+          s_audio_started);
+  s_min_queue = UINT32_MAX;
+  s_max_queue = 0;
+}
+#endif
+
 static bool InitAudio(void) {
   SDL_AudioSpec desired, obtained;
   const char *preroll = getenv("DKC1_AUDIO_PREROLL");
@@ -1572,18 +1894,27 @@ static bool InitAudio(void) {
   desired.channels = kAudioChannels;
   desired.samples = kAudioScratchFrames;
   desired.callback = NULL;
+#ifdef __SWITCH__
+  /* Own audren feeder (switch_audio.h): SDL's runs below the emulation
+   * thread's priority on its core and crackles whenever a frame runs long. */
+  (void)desired;
+  s_audio_device = Dkc1SwitchAudioOpen() ? 1 : 0;
+  obtained = desired;
+  obtained.samples = kDkc1SwitchAudioBufferFrames;
+#else
   s_audio_device = SDL_OpenAudioDevice(NULL, 0, &desired, &obtained, 0);
+#endif
   if (!s_audio_device) {
     fprintf(stderr, "warning: audio unavailable: %s\n", SDL_GetError());
     return false;
   }
   s_audio_target_frames = obtained.samples / 2.0 +
-      s_audio_preroll_blocks * kAudioFramesPerBlock;
+      s_audio_preroll_blocks * kAudioDeviceFramesPerBlock;
   RtlSetAudioOutputRate(kAudioRate);
   /* Do not start CoreAudio on an empty engine ring. The native producer needs
    * a few cartridge frames to reach its normal occupancy, after which the SDL
    * device receives a short host-side preroll. */
-  SDL_PauseAudioDevice(s_audio_device, 1);
+  AudioPause(1);
   AudioTraceStats stats;
   audio_trace_get_stats(&stats);
   s_audio_ring_frames = stats.occupancy_current;
@@ -1605,8 +1936,12 @@ static void ResetAudioTimeline(void) {
   /* SDL's queue belongs to the abandoned host timeline after a rewind or
    * pause. The runtime load already rebases the APU-port guest timeline; this
    * clears the other half and resumes only after a fresh device preroll. */
+#ifdef __SWITCH__
+  Dkc1SwitchAudioClear();
+#else
   SDL_ClearQueuedAudio(s_audio_device);
-  SDL_PauseAudioDevice(s_audio_device, 1);
+#endif
+  AudioPause(1);
   s_audio_accumulator = 0.0;
   s_audio_started = 0;
   s_audio_last_queued_frames = 0;
@@ -1646,7 +1981,7 @@ static void PumpAudio(void) {
   const Uint32 bytes_per_frame =
       kAudioChannels * (Uint32)sizeof(int16_t);
   Uint32 queued_frames =
-      SDL_GetQueuedAudioSize(s_audio_device) / bytes_per_frame;
+      AudioQueuedBytes() / bytes_per_frame;
   s_audio_last_queued_frames = queued_frames;
   /* Keep the queued device fed at the selected host presentation cadence.
    * The release clock is exactly 60 Hz; the opted-in display-link path updates
@@ -1660,6 +1995,9 @@ static void PumpAudio(void) {
     frames = kAudioScratchFrames;
   RtlRenderAudio(s_audio_scratch, frames, kAudioChannels);
   Dkc1Msu1Mix(s_msu1, s_audio_scratch, frames, kAudioChannels, kAudioRate);
+#ifdef __SWITCH__
+  SwitchAudioDiagnostics(frames);
+#endif
   /* Always consume the canonical audio, including muted assist frames. */
   if (s_fast_forward || s_paused) return;
   if (queued_frames >= kAudioMaximumQueuedFrames) {
@@ -1677,7 +2015,11 @@ static void PumpAudio(void) {
   int volume=s_graphics.audio_enabled ? s_graphics.volume : 0;
   if (volume!=100) for (int i=0;i<frames*kAudioChannels;i++)
     s_audio_output[i]=(int16_t)((int)s_audio_output[i]*volume/100);
+#ifdef __SWITCH__
+  if (Dkc1SwitchAudioQueue(s_audio_output, bytes) != 0) {
+#else
   if (SDL_QueueAudio(s_audio_device, s_audio_output, bytes) != 0) {
+#endif
     s_audio_drops++;
     return;
   }
@@ -1689,8 +2031,8 @@ static void PumpAudio(void) {
     s_audio_internal_underflows = stats.output_underflows;
   }
   if (!s_audio_started &&
-      queued_frames >= s_audio_preroll_blocks * kAudioFramesPerBlock) {
-    SDL_PauseAudioDevice(s_audio_device, 0);
+      queued_frames >= s_audio_preroll_blocks * kAudioDeviceFramesPerBlock) {
+    AudioPause(0);
     s_audio_started = 1;
   }
 }
@@ -1830,10 +2172,18 @@ static void SetAspectMode(Dkc1VideoAspect requested) {
   Dkc1VideoSetAspect(requested);
   const int new_width = Dkc1VideoWidth();
 #ifndef _WIN32
-  SDL_Texture *new_texture = SDL_CreateTexture(
+  SDL_Texture *new_texture = NULL;
+#ifdef __SWITCH__
+  if (!s_switch_gl)
+#endif
+  new_texture = SDL_CreateTexture(
       s_renderer, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STREAMING,
       new_width, kDkc1VideoHeight);
-  if (!new_texture) {
+  if (!new_texture
+#ifdef __SWITCH__
+      && !s_switch_gl
+#endif
+      ) {
     Dkc1VideoSetAspect(old_aspect);
     snprintf(s_status, sizeof s_status, "aspect change failed: %.180s",
              SDL_GetError());
@@ -1970,6 +2320,241 @@ unsigned Dkc1MacPauseMenuController(void) {
   return result;
 }
 
+#ifdef __SWITCH__
+/* Settings take effect immediately except MSU-1, whose pack (and the SPC
+ * music mute) is chosen at boot. */
+static void SwitchMenuApply(void) {
+  /* The CPU always runs at 1785 MHz (restored on exit); not a setting. */
+  static bool s_boosted;
+  if (!s_boosted) {
+    Dkc1SwitchClockBoost(true);
+    s_boosted = true;
+  }
+  if (Dkc1HdReady())
+    Dkc1HdSetEnabled(s_menu.hd);
+  s_controls.assist_enabled = s_menu.rewind;
+  s_controls.assist_pads[0] =
+      DKC1_PAD_BUTTON(SDL_CONTROLLER_BUTTON_LEFTSHOULDER);   /* rewind */
+  s_controls.assist_pads[1] =
+      DKC1_PAD_BUTTON(SDL_CONTROLLER_BUTTON_RIGHTSHOULDER);  /* 3x speed */
+  s_controls.assist_pads[2] = s_controls.assist_pads[3] = 0;
+  if (!s_menu.rewind)
+    ClearRewind();
+  s_graphics.state_slot = s_menu.slot;
+  if (!s_menu.perf) {
+    s_perf.text[0] = 0;
+    s_overlay_live = Dkc1MenuIsOpen();
+  }
+}
+
+static void SwitchOverlayRefresh(void) {
+  memset(s_overlay, 0, sizeof s_overlay);
+  s_overlay_live = false;
+  if (s_menu.perf && s_perf.text[0]) {
+    Dkc1MenuDrawText(s_overlay, s_width, kDkc1VideoHeight, (size_t)s_width,
+                     4, 4, s_perf.text, s_perf.warn ? 0xff8060 : 0x80ff80);
+    s_overlay_live = true;
+  }
+  if (Dkc1MenuIsOpen()) {
+    Dkc1MenuDraw(&s_menu, s_overlay, s_width, kDkc1VideoHeight,
+                 (size_t)s_width, s_cheat_count && s_menu.cheat_codes
+                     ? "cheats.txt cargado" : NULL,
+                 s_menu_message);
+    s_overlay_live = true;
+  }
+}
+
+static void SwitchMenuOpen(void) {
+  if (Dkc1MenuIsOpen())
+    return;
+  Dkc1MenuOpen();
+  s_menu_message[0] = 0;
+  StopControllerRumble();
+  if (s_audio_device) AudioPause(1);
+  /* Buttons held while opening must not act on the menu. */
+  Dkc1GamepadState pad;
+  s_menu_buttons = Dkc1SwitchReadPads(&pad, 1) > 0 ? pad.buttons : 0;
+  SwitchOverlayRefresh();
+}
+
+static void SwitchMenuClose(void) {
+  Dkc1MenuClose();
+  SwitchOverlayRefresh();
+  ResetAudioTimeline();
+  s_host_actions = s_previous_host_actions = 0;
+  s_input_release_gate = 1;
+  s_reanchor_pacer = 1;
+}
+
+/* One iteration of the paused menu loop. */
+static void SwitchMenuFrame(void) {
+  PollEvents();
+  Dkc1GamepadState pad = {0};
+  const uint32_t buttons = Dkc1SwitchReadPads(&pad, 1) > 0 ? pad.buttons : 0;
+  uint32_t pressed = buttons & ~s_menu_buttons;
+  s_menu_buttons = buttons;
+  /* The left stick steers the cursor like the D-pad. */
+  static int s_stick_held;
+  const int stick = pad.left_y > 16000 ? 1 : pad.left_y < -16000 ? 2
+                    : pad.left_x < -16000 ? 3 : pad.left_x > 16000 ? 4 : 0;
+  if (stick && stick != s_stick_held) {
+    static const uint32_t kStickButtons[] = {
+      0, kDkc1GamepadDpadUp, kDkc1GamepadDpadDown, kDkc1GamepadDpadLeft,
+      kDkc1GamepadDpadRight};
+    pressed |= kStickButtons[stick];
+  }
+  s_stick_held = stick;
+  if (pressed & (kDkc1GamepadRightStick | kDkc1GamepadStart))
+    pressed |= kDkc1GamepadB;  /* the opening buttons close it again */
+  switch (Dkc1MenuUpdate(&s_menu, pressed)) {
+    case kDkc1MenuActionClose:
+      SwitchMenuClose();
+      break;
+    case kDkc1MenuActionSave:
+      QuickSave();
+      snprintf(s_menu_message, sizeof s_menu_message, "%s ranura %d",
+               strstr(s_status, "FAILED") ? "Error al guardar" : "Guardado en",
+               s_menu.slot + 1);
+      break;
+    case kDkc1MenuActionLoad:
+      QuickLoad();
+      if (strstr(s_status, "FAILED")) {
+        snprintf(s_menu_message, sizeof s_menu_message,
+                 "Ranura %d vacia", s_menu.slot + 1);
+      } else {
+        SwitchMenuClose();
+        return;
+      }
+      break;
+    case kDkc1MenuActionChanged:
+      SwitchMenuApply();
+      Dkc1MenuSaveSettings(&s_menu, kSwitchMenuConfig);
+      s_menu_message[0] = 0;
+      break;
+    case kDkc1MenuActionQuit:
+      s_running = 0;
+      return;
+    default:
+      break;
+  }
+  SwitchOverlayRefresh();
+  s_reanchor_pacer = 1;
+  Present();
+  SDL_Delay(16);
+}
+
+/* Diagnostics (audio_dump.flag): the loop's real frame rate over 120
+ * uninterrupted frames, its median interval and the GL swap time. The audio
+ * is sized for a fixed 60 Hz, which FramePacerAdvance's fixed cadence
+ * delivers on average; an empty audio queue with these figures below 60 Hz
+ * means the loop is losing time again. */
+static int CompareDoubles(const void *a, const void *b) {
+  const double x = *(const double *)a, y = *(const double *)b;
+  return x < y ? -1 : x > y;
+}
+
+static void SwitchTrackFrameRate(double presented_at, double swap,
+                                 double frequency, bool interrupted) {
+  enum { kWindow = 120 };
+  static double s_last, s_intervals[kWindow];
+  static int s_count;
+  static double s_swap_sum, s_swap_max;
+  static double s_fps = 60.0;
+  const double interval = s_last > 0.0 ? presented_at - s_last : 0.0;
+  s_last = presented_at;
+  if (interrupted || interval <= 0.0 || interval > frequency / 10.0)
+    return;  /* a pause, a menu or a stall: not a frame interval */
+  s_intervals[s_count++] = interval;
+  s_swap_sum += swap;
+  if (swap > s_swap_max)
+    s_swap_max = swap;
+  if (s_count < kWindow)
+    return;
+  double sorted[kWindow];
+  memcpy(sorted, s_intervals, sizeof sorted);
+  qsort(sorted, kWindow, sizeof sorted[0], CompareDoubles);
+  const double median = sorted[kWindow / 2];
+  double sum = 0.0;
+  const int kept = kWindow;
+  for (int i = 0; i < kWindow; i++)
+    sum += sorted[i];
+  const double fps = kept * frequency / sum;
+  if (s_switch_vsync && median < frequency / 72.0) {
+    /* The swap is not waiting for vblank after all: pace by the clock. */
+    s_switch_vsync = false;
+    SDL_GL_SetSwapInterval(0);
+    fprintf(stderr, "[pacing] swap does not wait for vblank; timer pacing\n");
+  } else if (fps >= 50.0 && fps <= 70.0) {
+    /* Reported only. With the fixed cadence the loop averages exactly
+     * 60 Hz, so the audio keeps its fixed 60 Hz sizing; resizing it from a
+     * measurement chased jitter (a trimmed mean read 61.6 Hz while vblank
+     * misses held the real rate near 57 Hz). */
+    s_fps = s_fps * 0.75 + fps * 0.25;
+  }
+  if (s_audio_diag > 0)
+    fprintf(stderr, "[audio-diag] loop=%.3f Hz (median %.2f ms, %d/%d kept) "
+            "audio_fps=%.3f vsync=%d swap avg=%.2f max=%.2f ms\n",
+            fps, median * 1000.0 / frequency, kept, kWindow, s_fps,
+            s_switch_vsync, s_swap_sum * 1000.0 / frequency / kWindow,
+            s_swap_max * 1000.0 / frequency);
+  s_count = 0;
+  s_swap_sum = s_swap_max = 0.0;
+}
+
+/* Average frame cost over each second: total, emulation (CPU + APU), PPU +
+ * HD + upload, audio; and how many frames missed the 16.7 ms budget. */
+static void SwitchPerfRecord(const Dkc1FrameWorkProfile *profile,
+                             double work, double frequency) {
+  if (!s_menu.perf)
+    return;
+  const double ms = 1000.0 / frequency;
+  s_perf.work += work * ms;
+  s_perf.emulation += profile->emulation * ms;
+  s_perf.render += profile->ppu * ms;
+  s_perf.audio += profile->audio * ms;
+  if (work * ms > s_perf.worst)
+    s_perf.worst = work * ms;
+  if (work * ms > 16.7)
+    s_perf.slow++;
+  if (++s_perf.frames < 60)
+    return;
+  const double n = s_perf.frames;
+  /* `aud`: audren buffers played as silence this second (ring ran dry). */
+  static uint32_t s_last_underruns;
+  const uint32_t underruns = Dkc1SwitchAudioUnderruns();
+  const unsigned gaps = (unsigned)(underruns - s_last_underruns);
+  s_last_underruns = underruns;
+  snprintf(s_perf.text, sizeof s_perf.text,
+           "%.1fms cpu%.1f ppu%.1f max%.0f lento%d aud%u", s_perf.work / n,
+           s_perf.emulation / n, s_perf.render / n, s_perf.worst,
+           s_perf.slow, gaps);
+  fprintf(stderr, "[perf] %s audio%.1f\n", s_perf.text, s_perf.audio / n);
+  {
+    static uint64_t s_last_encode_ns;
+    Dkc1HdStats hd;
+    Dkc1HdGetStats(&hd);
+    fprintf(stderr, "[hd-perf] draw%.2f (encode%.2f) submit%.2f gpu%.2f ms\n",
+            s_hd_perf.draw * ms / n,
+            (hd.compose_ns - s_last_encode_ns) / 1e6 / n,
+            s_hd_perf.submit * ms / n, s_hd_perf.gpu * ms / n);
+    s_last_encode_ns = hd.compose_ns;
+    s_hd_perf.draw = s_hd_perf.submit = s_hd_perf.gpu = 0;
+    static int s_flag = -1;
+    if (s_flag < 0) {
+      FILE *flag = fopen("gpu.flag", "rb");
+      s_flag = flag != NULL;
+      if (flag) fclose(flag);
+    }
+    s_hd_perf.gpu_finish = s_flag;
+  }
+  s_perf.warn = s_perf.slow > 0 || gaps > 0;
+  s_perf.work = s_perf.emulation = s_perf.render = s_perf.audio = 0;
+  s_perf.worst = 0;
+  s_perf.frames = s_perf.slow = 0;
+  SwitchOverlayRefresh();
+}
+#endif
+
 static void OpenPauseMenu(int graphics_page) {
 #ifndef __SWITCH__
   /* No pause menu on Switch: the stub always reports closed, so there is
@@ -1980,7 +2565,7 @@ static void OpenPauseMenu(int graphics_page) {
   if (!SDL_GetWindowWMInfo(s_window,&window)) return;
   int was_paused=s_paused;
   s_paused=1; s_step_once=0; StopControllerRumble();
-  if (s_audio_device) SDL_PauseAudioDevice(s_audio_device,1);
+  if (s_audio_device) AudioPause(1);
   s_graphics.aspect=Dkc1VideoGetAspect(); s_graphics.edge=Dkc1VideoGetEdgePolicy();
   s_graphics.fullscreen=s_fullscreen;
   // Discard older packets so the menu rests on the latest completed image.
@@ -1999,6 +2584,7 @@ static void OpenPauseMenu(int graphics_page) {
   Dkc1MacMetalPresenterSetActive(1); Present(); UpdateTitle();
 #else
   (void)graphics_page;
+  SwitchMenuOpen();
 #endif
 }
 
@@ -2025,7 +2611,7 @@ static void HandleKey(SDL_Keycode key, SDL_Keymod mod) {
     if (s_paused) {
       StopControllerRumble();
       if (s_audio_device)
-        SDL_PauseAudioDevice(s_audio_device, 1);
+        AudioPause(1);
     } else {
       ResetAudioTimeline();
     }
@@ -2067,7 +2653,7 @@ void Dkc1MacMenuCommand(int command) {
       return;
     case kDkc1MacMenuControls:
       StopControllerRumble();
-      if (s_audio_device) SDL_PauseAudioDevice(s_audio_device, 1);
+      if (s_audio_device) AudioPause(1);
       Dkc1MacEditControls(&s_controls);
       if (!s_controls.assist_enabled) ClearRewind();
       ResetAudioTimeline();
@@ -2082,7 +2668,7 @@ void Dkc1MacMenuCommand(int command) {
       if (s_paused) {
         StopControllerRumble();
         if (s_audio_device)
-          SDL_PauseAudioDevice(s_audio_device, 1);
+          AudioPause(1);
       } else {
         ResetAudioTimeline();
       }
@@ -2277,6 +2863,7 @@ static void SwitchSramFlushIfDirty(void) {
 static void Cleanup(uint8_t *rom) {
 #ifdef __SWITCH__
   SwitchSramFlushIfDirty();
+  Dkc1SwitchClockExit();
 #endif
 #ifdef _WIN32
   Dkc1WindowsDetach();
@@ -2303,8 +2890,20 @@ static void Cleanup(uint8_t *rom) {
   Dkc1Msu1Close(s_msu1);
   s_msu1 = NULL;
   Dkc1BabyKongUnload();
-  if (s_audio_device)
+  if (s_audio_device) {
+#ifdef __SWITCH__
+    Dkc1SwitchAudioClose();
+#else
     SDL_CloseAudioDevice(s_audio_device);
+#endif
+  }
+#ifdef __SWITCH__
+  if (s_switch_gl) {
+    Dkc1HdGpuShutdown();
+    SDL_GL_DeleteContext(s_switch_gl);
+    s_switch_gl = NULL;
+  }
+#endif
   if (s_hd_texture)
     SDL_DestroyTexture(s_hd_texture);
   if (s_texture)
@@ -2392,6 +2991,12 @@ int main(int argc, char **argv) {
     return 2;
   }
 
+#ifdef __SWITCH__
+  Dkc1SwitchPinMainThread();
+  Dkc1MenuLoadSettings(&s_menu, kSwitchMenuConfig);
+  s_cheat_count = Dkc1MenuLoadCheats(kSwitchCheatFile, s_cheats,
+                                     kDkc1MenuMaxCheats);
+#endif
   char *music_pack_path = ConfiguredMusicPackPath();
   if (music_pack_path) {
     s_msu1 = Dkc1Msu1Open(music_pack_path, rom_error, sizeof rom_error);
@@ -2477,6 +3082,9 @@ int main(int argc, char **argv) {
   if (Dkc1HdReady() && !getenv("DKC1_HD_PACK"))
     Dkc1HdSetEnabled(!EnvironmentEnabled("DKC1_HD_DISABLE") &&
                      Dkc1MacSavedHdEnabled() != 0);
+#ifdef __SWITCH__
+  SwitchMenuApply();
+#endif
 
   const char *snapshot = getenv("DKC1_SAVESTATE_INPUT");
   if (snapshot && *snapshot && !RtlLoadSnapshot(snapshot)) {
@@ -2622,6 +3230,10 @@ int main(int argc, char **argv) {
     /* Home-button / suspend pump; libnx kills titles that starve
      * appletMainLoop. An applet exit request also arrives as SDL_QUIT. */
     if (!SwitchImpl_Tick()) break;
+    if (Dkc1MenuIsOpen()) {
+      SwitchMenuFrame();
+      continue;
+    }
 #endif
     if (s_paused && !s_step_once) {
       PollEvents();
@@ -2657,6 +3269,9 @@ int main(int argc, char **argv) {
         pacing_log.target = pacer.next_deadline;
         display_frame_sync = 1;
       } else {
+#ifdef __SWITCH__
+        if (!s_switch_vsync)
+#endif
         FramePacerWaitForWorkWindow(&pacer);
         pacing_log.target = pacer.next_deadline;
       }
@@ -2690,49 +3305,18 @@ int main(int argc, char **argv) {
     }
     phase_start = phase_end;
     uint32_t live_input = PollInput();
-#ifdef SWITCH_DEBUG
-    /* Debug-only (make DEBUG=1): L3 = quick-save, R3 = quick-load.
-     * Applied after the assist gate, which strips state actions while
-     * assist tools are off. Edge-triggered so a held click fires once. */
+#ifdef __SWITCH__
+    /* Clicking the right stick opens the in-game menu (Plus + Minus does
+     * too, through the pause chord in PollInput). */
     {
-      Dkc1GamepadState dbg_pad;
-      if (Dkc1SwitchReadPads(&dbg_pad, 1) > 0) {
-        static uint32_t s_prev_stick_click;
-        uint32_t cur = dbg_pad.buttons &
-            (kDkc1GamepadLeftStick | kDkc1GamepadRightStick);
-        uint32_t pressed = cur & ~s_prev_stick_click;
-        s_prev_stick_click = cur;
-        if (pressed & kDkc1GamepadLeftStick) {
-          s_host_actions |= kDkc1HostSaveState;
-          fprintf(stderr, "[SwitchDbg] quick-save\n");
-        }
-        if (pressed & kDkc1GamepadRightStick) {
-          s_host_actions |= kDkc1HostLoadState;
-          fprintf(stderr, "[SwitchDbg] quick-load\n");
-        }
-      }
-    }
-#endif
-#ifdef SWITCH_DEBUG
-    /* Debug-only (make DEBUG=1): L3 = quick-save, R3 = quick-load.
-     * Applied after the assist gate, which strips state actions while
-     * assist tools are off. Edge-triggered so a held click fires once. */
-    {
-      Dkc1GamepadState dbg_pad;
-      if (Dkc1SwitchReadPads(&dbg_pad, 1) > 0) {
-        static uint32_t s_prev_stick_click;
-        uint32_t cur = dbg_pad.buttons &
-            (kDkc1GamepadLeftStick | kDkc1GamepadRightStick);
-        uint32_t pressed = cur & ~s_prev_stick_click;
-        s_prev_stick_click = cur;
-        if (pressed & kDkc1GamepadLeftStick) {
-          s_host_actions |= kDkc1HostSaveState;
-          fprintf(stderr, "[SwitchDbg] quick-save\n");
-        }
-        if (pressed & kDkc1GamepadRightStick) {
-          s_host_actions |= kDkc1HostLoadState;
-          fprintf(stderr, "[SwitchDbg] quick-load\n");
-        }
+      Dkc1GamepadState pad;
+      const uint32_t buttons =
+          Dkc1SwitchReadPads(&pad, 1) > 0 ? pad.buttons : 0;
+      const uint32_t pressed = buttons & ~s_menu_buttons;
+      s_menu_buttons = buttons;
+      if (pressed & kDkc1GamepadRightStick) {
+        SwitchMenuOpen();
+        continue;
       }
     }
 #endif
@@ -2755,6 +3339,9 @@ int main(int argc, char **argv) {
       s_rewinding = 1;
       RewindOneStep();
       Present();
+#ifdef __SWITCH__
+      if (!s_switch_vsync)
+#endif
       FramePacerWaitUntil(pacer.next_deadline, pacer.frequency);
       FramePacerAdvance(&pacer, FramePacerNow(), 0);
       if (s_assist_test_log) fprintf(s_assist_test_log,
@@ -2777,6 +3364,9 @@ int main(int argc, char **argv) {
     phase_end = FramePacerNow();
     work_profile.input = phase_end - phase_start;
     phase_start = phase_end;
+#ifdef __SWITCH__
+    Dkc1MenuApplyCheats(&s_menu, g_ram, s_cheats, s_cheat_count);
+#endif
     Dkc1StompProbeCapture(&s_stomp_probe, g_ram);
     RtlRunFrame(input);
     if (Dkc1StompProbeAccepted(&s_stomp_probe, g_ram))
@@ -2801,14 +3391,19 @@ int main(int argc, char **argv) {
     Dkc1DrawPpuFrame();
     phase_end = FramePacerNow();
     work_profile.ppu += phase_end - phase_start;
+#ifdef __SWITCH__
+    s_hd_perf.draw += phase_end - phase_start;
+#endif
     phase_start = phase_end;
     s_host_frame++;
 #ifdef __SWITCH__
     /* Check SRAM every ~5 s and persist it only if it changed, so
      * progress survives unclean exits without rewriting the SD card on
      * every tick; the framework exit/focus hooks cover clean quits. */
-    if (s_host_frame != 0 && (s_host_frame % 300) == 0)
+    if (s_host_frame != 0 && (s_host_frame % 300) == 0) {
       SwitchSramFlushIfDirty();
+      Dkc1SwitchClockMaintain();
+    }
     /* Dock/handheld transitions mid-session: resize to the matching
      * mode (checked 12x/sec; SDL_SetWindowSize switches the output). */
     if ((s_host_frame % 5) == 0) {
@@ -2872,6 +3467,9 @@ int main(int argc, char **argv) {
         work_profile.diagnostics * 1000.0 / pacer.frequency;
     pacing_log.audio_ms = work_profile.audio * 1000.0 / pacer.frequency;
     PacingLogInjectTestStall(&pacing_log, s_host_frame);
+#ifdef __SWITCH__
+    SwitchPerfRecord(&work_profile, work_end - work_start, pacer.frequency);
+#endif
 
     /* CADisplayLink wakes one interval before a concrete targetTimestamp.
      * Texture upload and command encoding are already complete. Submit the
@@ -2889,6 +3487,9 @@ int main(int argc, char **argv) {
         pacing_log.target = pacer.next_deadline;
       }
       const double final_wait_start = FramePacerNow();
+#ifdef __SWITCH__
+      if (!s_switch_vsync)
+#endif
       FramePacerWaitUntil(
           pacer.next_deadline - pacer.frequency * kMacSubmitLeadSeconds,
           pacer.frequency);
@@ -2898,6 +3499,12 @@ int main(int argc, char **argv) {
     const double present_start = FramePacerNow();
     SubmitPresentation();
     const double presented_at = FramePacerNow();
+#ifdef __SWITCH__
+    SwitchTrackFrameRate(presented_at, presented_at - present_start,
+                         pacer.frequency,
+                         single_step || s_paused || s_fast_forward ||
+                             s_rewinding || s_reanchor_pacer);
+#endif
     FramePacerRecordPresentWait(&pacer, presented_at - present_start);
     FramePacerRecordPresent(&pacer, presented_at);
     PacingLogPresented(&pacing_log, &pacer, &display_pacer,
@@ -2907,8 +3514,11 @@ int main(int argc, char **argv) {
     } else if (display_frame_sync) {
       s_reanchor_pacer = s_paused ? 1 : 0;
     } else {
-      FramePacerAdvance(&pacer, presented_at,
-                        s_reanchor_pacer || s_paused);
+      bool reanchor = s_reanchor_pacer || s_paused;
+#ifdef __SWITCH__
+      reanchor = reanchor || s_switch_vsync;  /* the vblank is the clock */
+#endif
+      FramePacerAdvance(&pacer, presented_at, reanchor);
       s_reanchor_pacer = s_paused ? 1 : 0;
     }
     const char *pause_after = getenv("DKC1_PAUSE_AFTER_FRAME");

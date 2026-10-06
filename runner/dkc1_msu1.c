@@ -1,18 +1,25 @@
 #include "dkc1_msu1.h"
 
+#include <SDL.h>
+
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <math.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 
-/* Compressed packs (tools/msu1_compress.py): Ogg Vorbis tracks decoded in
- * small chunks from disk, so they need neither mmap nor the whole track in
- * memory. Header-only here; the implementation is built in
- * runner/dkc1_stb_vorbis.c. */
+#ifdef __SWITCH__
+#include "switch_clock.h"
+#endif
+
+/* Compressed packs (tools/msu1_compress.py): Ogg Vorbis tracks. A worker
+ * thread reads the current track into memory and decodes it ahead into a
+ * ring, so the frame-critical mixer never touches the disk or the decoder.
+ * Header-only here; the implementation is built in runner/dkc1_stb_vorbis.c. */
 #define STB_VORBIS_HEADER_ONLY
 #define STB_VORBIS_NO_PUSHDATA_API
 #include "../third_party/stb_vorbis/stb_vorbis.c"
@@ -48,17 +55,28 @@ static int munmap(void *address,size_t size) {
 #include <unistd.h>
 #endif
 
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+
 #ifndef PATH_MAX
 #define PATH_MAX 4096
 #endif
 
 enum {
-  kMsuInputRate = 44100,
+  kMsuPcmRate = 44100,    /* MSU-1 PCM is 44.1 kHz by definition */
   kMsuPcmHeaderSize = 8,
   kMsuMaximumTheme = 31,
   kMsuTrackCount = kMsuMaximumTheme + 1,
   kSpcMuteRomOffset = 0x0AA9E5,
-  kMsuVorbisChunkFrames = 2048,
+  /* Decoded-ahead ring: half a second kept ready, decoded in small steps. */
+  kMsuRingFrames = 1 << 15,
+  kMsuRingAhead = 24000,
+  kMsuDecodeFrames = 1024,
+  kMsuBlockFrames = 512,  /* frames the mixer takes from the ring at once */
+  /* Resampler: 16-tap Kaiser-windowed sinc, 128 phases interpolated. */
+  kMsuTaps = 16,
+  kMsuPhases = 128,
 };
 
 typedef struct Dkc1MsuTrack {
@@ -66,11 +84,29 @@ typedef struct Dkc1MsuTrack {
   size_t mapping_size;
   uint32_t total_frames;
   uint32_t loop_frame;
+  uint32_t rate;          /* source sample rate */
   int descriptor;
   bool present;
-  bool vorbis;            /* compressed: decoded from `path` on demand */
+  bool vorbis;            /* compressed: decoded by the stream worker */
   char path[PATH_MAX];
 } Dkc1MsuTrack;
+
+/* Shared with the decode worker; every field below `lock` is guarded by it.
+ * `request` names the track the main thread wants; the ring holds frames of
+ * request `ring_request` only, so stale frames are never mixed. */
+typedef struct MsuStream {
+  SDL_Thread *thread;
+  SDL_mutex *lock;
+  SDL_cond *wake;
+  bool quit;
+  uint32_t request;
+  const Dkc1MsuTrack *request_track;
+  bool request_loop;
+  uint32_t ring_request;
+  uint32_t read, write;   /* free-running frame counts */
+  bool ended;             /* no more frames for ring_request */
+  int16_t ring[kMsuRingFrames * 2];
+} MsuStream;
 
 struct Dkc1Msu1 {
   char directory[PATH_MAX];
@@ -78,17 +114,21 @@ struct Dkc1Msu1 {
   const Dkc1MsuTrack *track;
   uint32_t total_frames;
   uint32_t loop_frame;
-  uint32_t source_frame;
-  uint32_t phase;
+  uint32_t source_frame;  /* PCM read position */
   uint16_t theme;
   unsigned track_number;
-  int16_t current_sample[2];
-  int16_t next_sample[2];
-  /* Vorbis streaming state for the current compressed track. */
-  stb_vorbis *decoder;
-  int16_t chunk[kMsuVorbisChunkFrames * 2];
-  int chunk_frames;
-  int chunk_pos;
+  MsuStream *stream;
+  uint32_t request;       /* this thread's view of stream->request */
+  int16_t block[kMsuBlockFrames * 2];
+  int block_frames, block_pos;
+  /* Resampler: the last kMsuTaps source frames (twice, so the window is
+   * always contiguous), the fractional position in output-rate units, and
+   * the phase table for the current rate pair. */
+  float history[2][kMsuTaps * 2];
+  int history_pos;
+  uint32_t phase;
+  uint32_t rate_in, rate_out;
+  float taps[kMsuPhases + 1][kMsuTaps];
   double gain;
   bool loop;
   bool playing;
@@ -118,69 +158,286 @@ static int16_t ReadLittle16(const uint8_t bytes[2]) {
   return (int16_t)(uint16_t)(bytes[0] | ((uint16_t)bytes[1] << 8));
 }
 
+/* ---- Decode worker ----------------------------------------------------- */
+
+static uint8_t *LoadWholeFile(const char *path, int *size) {
+  FILE *file = fopen(path, "rb");
+  if (!file)
+    return NULL;
+  uint8_t *data = NULL;
+  long length = -1;
+  if (fseek(file, 0, SEEK_END) == 0)
+    length = ftell(file);
+  if (length > 0 && length < INT_MAX && fseek(file, 0, SEEK_SET) == 0) {
+    data = malloc((size_t)length);
+    if (data && fread(data, 1, (size_t)length, file) != (size_t)length) {
+      free(data);
+      data = NULL;
+    }
+  }
+  fclose(file);
+  if (data)
+    *size = (int)length;
+  return data;
+}
+
+static int SDLCALL StreamWorker(void *arg) {
+  MsuStream *stream = arg;
+#ifdef __SWITCH__
+  Dkc1SwitchPinWorker(2);  /* off the emulation core */
+#endif
+  uint32_t current = 0;
+  const Dkc1MsuTrack *track = NULL;
+  bool loop = false;
+  uint8_t *data = NULL;
+  stb_vorbis *decoder = NULL;
+  uint32_t position = 0;
+  static int16_t decoded[kMsuDecodeFrames * 2];
+
+  SDL_LockMutex(stream->lock);
+  for (;;) {
+    while (!stream->quit && stream->request == current &&
+           (stream->ended || !decoder ||
+            stream->write - stream->read >= kMsuRingAhead))
+      SDL_CondWaitTimeout(stream->wake, stream->lock, 50);
+    if (stream->quit)
+      break;
+    if (stream->request != current) {
+      /* New track: drop the old one and load this one outside the lock. */
+      current = stream->request;
+      track = stream->request_track;
+      loop = stream->request_loop;
+      stream->ring_request = current;
+      stream->read = stream->write = 0;
+      stream->ended = false;
+      SDL_UnlockMutex(stream->lock);
+      if (decoder)
+        stb_vorbis_close(decoder);
+      decoder = NULL;
+      free(data);
+      data = NULL;
+      position = 0;
+      int size = 0, error = 0;
+      if (track && track->vorbis &&
+          (data = LoadWholeFile(track->path, &size)) != NULL)
+        decoder = stb_vorbis_open_memory(data, size, &error, NULL);
+      SDL_LockMutex(stream->lock);
+      if (stream->request == current && !decoder)
+        stream->ended = true;
+      continue;
+    }
+    SDL_UnlockMutex(stream->lock);
+    uint32_t want = kMsuDecodeFrames;
+    if (position + want > track->total_frames)
+      want = track->total_frames - position;
+    const int got = want ? stb_vorbis_get_samples_short_interleaved(
+                               decoder, 2, decoded, (int)want * 2)
+                         : 0;
+    bool end = false;
+    if (got > 0) {
+      position += (uint32_t)got;
+    } else if (loop && track->loop_frame < track->total_frames &&
+               stb_vorbis_seek(decoder, track->loop_frame)) {
+      position = track->loop_frame;
+    } else {
+      end = true;
+    }
+    SDL_LockMutex(stream->lock);
+    if (stream->request != current)
+      continue;
+    if (end)
+      stream->ended = true;
+    for (int i = 0; i < got; i++) {
+      const uint32_t at = (stream->write + (uint32_t)i) & (kMsuRingFrames - 1);
+      stream->ring[at * 2] = decoded[i * 2];
+      stream->ring[at * 2 + 1] = decoded[i * 2 + 1];
+    }
+    stream->write += (uint32_t)(got > 0 ? got : 0);
+  }
+  SDL_UnlockMutex(stream->lock);
+  if (decoder)
+    stb_vorbis_close(decoder);
+  free(data);
+  return 0;
+}
+
+static MsuStream *StartStream(void) {
+  MsuStream *stream = calloc(1, sizeof *stream);
+  if (!stream)
+    return NULL;
+  stream->lock = SDL_CreateMutex();
+  stream->wake = SDL_CreateCond();
+  if (stream->lock && stream->wake)
+    stream->thread =
+        SDL_CreateThread(StreamWorker, "DKC1 MSU-1", stream);
+  if (!stream->thread) {
+    if (stream->wake) SDL_DestroyCond(stream->wake);
+    if (stream->lock) SDL_DestroyMutex(stream->lock);
+    free(stream);
+    return NULL;
+  }
+  return stream;
+}
+
+static void StopStream(MsuStream *stream) {
+  if (!stream)
+    return;
+  SDL_LockMutex(stream->lock);
+  stream->quit = true;
+  SDL_CondSignal(stream->wake);
+  SDL_UnlockMutex(stream->lock);
+  SDL_WaitThread(stream->thread, NULL);
+  SDL_DestroyCond(stream->wake);
+  SDL_DestroyMutex(stream->lock);
+  free(stream);
+}
+
+/* Ask the worker for `track` (NULL: stop). */
+static void RequestStream(Dkc1Msu1 *player, const Dkc1MsuTrack *track,
+                          bool loop) {
+  MsuStream *stream = player->stream;
+  if (!stream)
+    return;
+  SDL_LockMutex(stream->lock);
+  stream->request++;
+  stream->request_track = track;
+  stream->request_loop = loop;
+  player->request = stream->request;
+  SDL_CondSignal(stream->wake);
+  SDL_UnlockMutex(stream->lock);
+  player->block_frames = player->block_pos = 0;
+}
+
+/* ---- Resampler ----------------------------------------------------------- */
+
+static double BesselI0(double x) {
+  double sum = 1.0, term = 1.0;
+  for (int k = 1; k < 32; k++) {
+    term *= (x / (2.0 * k)) * (x / (2.0 * k));
+    sum += term;
+  }
+  return sum;
+}
+
+/* taps[p][k]: weight of window frame k for an output at fraction p/P past
+ * window frame kMsuTaps/2 - 1. Low-pass at 95 % of the lower Nyquist rate,
+ * Kaiser beta 7 (about 70 dB stopband), unity DC gain per phase. */
+static void BuildTaps(Dkc1Msu1 *player, uint32_t rate_in, uint32_t rate_out) {
+  const double ratio = rate_out < rate_in ? (double)rate_out / rate_in : 1.0;
+  const double cutoff = 0.5 * ratio * 0.95;  /* cycles per input sample */
+  const double beta = 7.0, half = kMsuTaps / 2.0, norm = BesselI0(beta);
+  for (int p = 0; p <= kMsuPhases; p++) {
+    const double frac = (double)p / kMsuPhases;
+    double sum = 0.0;
+    for (int k = 0; k < kMsuTaps; k++) {
+      const double x = (double)k - (half - 1.0) - frac;
+      const double arg = 2.0 * cutoff * x;
+      const double sinc =
+          fabs(arg) < 1e-9 ? 1.0 : sin(M_PI * arg) / (M_PI * arg);
+      const double w = x / half;
+      const double window =
+          fabs(w) >= 1.0 ? 0.0 : BesselI0(beta * sqrt(1.0 - w * w)) / norm;
+      player->taps[p][k] = (float)(2.0 * cutoff * sinc * window);
+      sum += player->taps[p][k];
+    }
+    for (int k = 0; k < kMsuTaps; k++)
+      player->taps[p][k] = (float)(player->taps[p][k] / sum);
+  }
+  player->rate_in = rate_in;
+  player->rate_out = rate_out;
+}
+
+static void ResetResampler(Dkc1Msu1 *player) {
+  memset(player->history, 0, sizeof player->history);
+  player->history_pos = 0;
+  player->phase = 0;
+}
+
+static void PushHistory(Dkc1Msu1 *player, const int16_t sample[2]) {
+  const int at = player->history_pos;
+  for (int c = 0; c < 2; c++)
+    player->history[c][at] = player->history[c][at + kMsuTaps] = sample[c];
+  player->history_pos = (at + 1) % kMsuTaps;
+}
+
+/* ---- Source frames -------------------------------------------------------- */
+
 static void CloseTrack(Dkc1Msu1 *player) {
-  if (player->decoder)
-    stb_vorbis_close(player->decoder);
-  player->decoder = NULL;
-  player->chunk_frames = 0;
-  player->chunk_pos = 0;
+  if (player->track && player->track->vorbis)
+    RequestStream(player, NULL, false);
   player->track = NULL;
   player->playing = false;
   player->track_number = 0;
   player->total_frames = 0;
   player->source_frame = 0;
-  player->phase = 0;
-  memset(player->current_sample, 0, sizeof player->current_sample);
-  memset(player->next_sample, 0, sizeof player->next_sample);
+  player->block_frames = player->block_pos = 0;
+  ResetResampler(player);
 }
 
+#ifndef DKC1_MSU1_NO_MMAP
 static bool SeekFrame(Dkc1Msu1 *player, uint32_t frame) {
   if (!player->track || frame >= player->total_frames)
     return false;
-  if (player->decoder) {
-    if (!stb_vorbis_seek(player->decoder, frame))
-      return false;
-    player->chunk_frames = 0;
-    player->chunk_pos = 0;
-  }
   player->source_frame = frame;
   return true;
 }
+#endif
 
-static bool ReadVorbisFrame(Dkc1Msu1 *player, int16_t sample[2]) {
-  if (player->chunk_pos >= player->chunk_frames) {
-    player->chunk_frames = stb_vorbis_get_samples_short_interleaved(
-        player->decoder, 2, player->chunk, kMsuVorbisChunkFrames * 2);
-    player->chunk_pos = 0;
-    if (player->chunk_frames <= 0)
-      return false;
-  }
-  sample[0] = player->chunk[player->chunk_pos * 2];
-  sample[1] = player->chunk[player->chunk_pos * 2 + 1];
-  player->chunk_pos++;
-  player->source_frame++;
-  return true;
-}
-
-static bool ReadFrame(Dkc1Msu1 *player, int16_t sample[2]) {
+/* Next source frame: 1 = read, 0 = not decoded yet (try again next call),
+ * -1 = the track is over. */
+static int ReadFrame(Dkc1Msu1 *player, int16_t sample[2]) {
   if (!player->track)
-    return false;
+    return -1;
+  if (player->track->vorbis) {
+    if (player->block_pos >= player->block_frames) {
+      MsuStream *stream = player->stream;
+      int result = -1;
+      SDL_LockMutex(stream->lock);
+      if (stream->ring_request == player->request) {
+        uint32_t available = stream->write - stream->read;
+        if (available > kMsuBlockFrames)
+          available = kMsuBlockFrames;
+        for (uint32_t i = 0; i < available; i++) {
+          const uint32_t at = (stream->read + i) & (kMsuRingFrames - 1);
+          player->block[i * 2] = stream->ring[at * 2];
+          player->block[i * 2 + 1] = stream->ring[at * 2 + 1];
+        }
+        stream->read += available;
+        player->block_frames = (int)available;
+        player->block_pos = 0;
+        result = available ? 1 : stream->ended ? -1 : 0;
+        if (available && stream->write - stream->read < kMsuRingAhead)
+          SDL_CondSignal(stream->wake);
+      } else {
+        result = 0;  /* the worker has not switched tracks yet */
+      }
+      SDL_UnlockMutex(stream->lock);
+      if (result <= 0)
+        return result;
+    }
+    sample[0] = player->block[player->block_pos * 2];
+    sample[1] = player->block[player->block_pos * 2 + 1];
+    player->block_pos++;
+    return 1;
+  }
+#ifdef DKC1_MSU1_NO_MMAP
+  return -1;
+#else
   if (player->source_frame >= player->total_frames) {
     if (!player->loop || !SeekFrame(player, player->loop_frame))
-      return false;
+      return -1;
   }
-  if (player->track->vorbis)
-    return ReadVorbisFrame(player, sample);
   const size_t offset =
       kMsuPcmHeaderSize + (size_t)player->source_frame * 4u;
   if (offset > player->track->mapping_size ||
       player->track->mapping_size - offset < 4u)
-    return false;
+    return -1;
   const uint8_t *bytes = player->track->mapping + offset;
   sample[0] = ReadLittle16(bytes);
   sample[1] = ReadLittle16(bytes + 2);
   player->source_frame++;
-  return true;
+  return 1;
+#endif
 }
 
 static void UnmapTrack(Dkc1MsuTrack *track) {
@@ -221,12 +478,14 @@ static int ProbeVorbisFile(const char *path, Dkc1MsuTrack *track) {
       loop = (uint32_t)strtoul(entry + k, NULL, 10);
   }
   stb_vorbis_close(decoder);
-  if (info.channels != 2 || info.sample_rate != kMsuInputRate || frames < 2 ||
+  if (info.channels != 2 || info.sample_rate < 8000 ||
+      info.sample_rate > 192000 || frames < 2 ||
       snprintf(track->path, sizeof track->path, "%s", path) >=
           (int)sizeof track->path)
     return -1;
   track->total_frames = frames;
   track->loop_frame = loop;
+  track->rate = info.sample_rate;
   track->vorbis = true;
   track->present = true;
   return 1;
@@ -279,6 +538,7 @@ static int MapTrackFile(const char *path, Dkc1MsuTrack *track) {
   track->total_frames =
       (uint32_t)((mapping_size - kMsuPcmHeaderSize) / 4u);
   track->loop_frame = ReadLittle32(mapping + 4);
+  track->rate = kMsuPcmRate;
   track->descriptor = descriptor;
   track->present = true;
   return 1;
@@ -312,7 +572,7 @@ static bool OpenTrack(Dkc1Msu1 *player, unsigned theme) {
 
   const unsigned track = theme + 1;
   const Dkc1MsuTrack *cached = &player->tracks[track - 1u];
-  if (!cached->present)
+  if (!cached->present || (cached->vorbis && !player->stream))
     return false;
   player->track = cached;
   player->total_frames = cached->total_frames;
@@ -320,21 +580,10 @@ static bool OpenTrack(Dkc1Msu1 *player, unsigned theme) {
   player->loop = theme < sizeof kLoopTheme && kLoopTheme[theme] != 0 &&
                  player->loop_frame < player->total_frames;
   player->track_number = track;
-  player->phase = 0;
-  if (cached->vorbis) {
-    int error = 0;
-    player->decoder = stb_vorbis_open_filename(cached->path, &error, NULL);
-    if (!player->decoder) {
-      CloseTrack(player);
-      return false;
-    }
-  }
-  if (!SeekFrame(player, 0) ||
-      !ReadFrame(player, player->current_sample) ||
-      !ReadFrame(player, player->next_sample)) {
-    CloseTrack(player);
-    return false;
-  }
+  player->source_frame = 0;
+  ResetResampler(player);
+  if (cached->vorbis)
+    RequestStream(player, cached, player->loop);
   player->playing = true;
   return true;
 }
@@ -365,6 +614,14 @@ Dkc1Msu1 *Dkc1Msu1Open(const char *directory, char *error,
     Dkc1Msu1Close(player);
     return NULL;
   }
+  bool any_vorbis = false;
+  for (unsigned track = 0; track < kMsuTrackCount; track++)
+    any_vorbis |= player->tracks[track].vorbis;
+  if (any_vorbis && !(player->stream = StartStream())) {
+    SetError(error, error_size, "cannot start the MSU-1 decode thread");
+    Dkc1Msu1Close(player);
+    return NULL;
+  }
   player->gain = 1.0;
   const char *gain = getenv("DKC1_MSU1_GAIN");
   if (gain && *gain) {
@@ -381,6 +638,7 @@ void Dkc1Msu1Close(Dkc1Msu1 *player) {
   if (!player)
     return;
   CloseTrack(player);
+  StopStream(player->stream);
   for (unsigned track = 0; track < kMsuTrackCount; track++)
     UnmapTrack(&player->tracks[track]);
   free(player);
@@ -448,30 +706,66 @@ void Dkc1Msu1Mix(Dkc1Msu1 *player, int16_t *samples, int frames,
   if (!player || !player->playing || !samples || frames <= 0 ||
       channels != 2 || output_rate <= 0)
     return;
+  const uint32_t rate_in = player->track->rate;
+  if (rate_in != player->rate_in || (uint32_t)output_rate != player->rate_out)
+    BuildTaps(player, rate_in, (uint32_t)output_rate);
 
-  for (int frame = 0; frame < frames && player->playing; frame++) {
+  for (int frame = 0; frame < frames; frame++) {
+    /* Output at fraction phase/output_rate past window frame taps/2 - 1:
+     * blend the two nearest phase tables. */
+    const uint64_t scaled = (uint64_t)player->phase * kMsuPhases;
+    const int p = (int)(scaled / (uint32_t)output_rate);
+    const float t =
+        (float)(scaled % (uint32_t)output_rate) / (float)output_rate;
+    const float *a = player->taps[p], *b = player->taps[p + 1];
     for (int channel = 0; channel < 2; channel++) {
-      const int64_t interpolated =
-          ((int64_t)player->current_sample[channel] *
-               (output_rate - (int)player->phase) +
-           (int64_t)player->next_sample[channel] * player->phase) /
-          output_rate;
-      const int external = (int)(interpolated * player->gain);
+      const float *window = &player->history[channel][player->history_pos];
+      float acc = 0.0f;
+      for (int k = 0; k < kMsuTaps; k++)
+        acc += (a[k] + (b[k] - a[k]) * t) * window[k];
+      const int external = (int)lrintf(acc * (float)player->gain);
       const int index = frame * channels + channel;
       samples[index] = Saturate16((int)samples[index] + external);
     }
 
-    player->phase += kMsuInputRate;
+    player->phase += rate_in;
     while (player->phase >= (uint32_t)output_rate) {
-      player->phase -= (uint32_t)output_rate;
-      player->current_sample[0] = player->next_sample[0];
-      player->current_sample[1] = player->next_sample[1];
-      if (!ReadFrame(player, player->next_sample)) {
-        player->playing = false;
-        break;
+      int16_t sample[2];
+      const int read = ReadFrame(player, sample);
+      if (read == 0) {
+        /* Not decoded yet (track start): hold the position; try again on
+         * the next call rather than inventing samples. */
+        player->phase -= rate_in;
+        return;
       }
+      if (read < 0) {
+        player->playing = false;
+        return;
+      }
+      player->phase -= (uint32_t)output_rate;
+      PushHistory(player, sample);
     }
   }
+}
+
+/* Tools and tests: wait until the current track has frames ready. */
+bool Dkc1Msu1WaitReady(Dkc1Msu1 *player, int timeout_ms) {
+  if (!player || !player->playing)
+    return false;
+  if (!player->track->vorbis || !player->stream)
+    return true;
+  for (int waited = 0; waited <= timeout_ms; waited += 2) {
+    MsuStream *stream = player->stream;
+    SDL_LockMutex(stream->lock);
+    const bool ready = stream->ring_request == player->request &&
+                       (stream->ended ||
+                        stream->write - stream->read >= kMsuRingAhead);
+    SDL_UnlockMutex(stream->lock);
+    if (ready)
+      return true;
+    SDL_Delay(2);
+  }
+  return false;
 }
 
 unsigned Dkc1Msu1CurrentTrack(const Dkc1Msu1 *player) {

@@ -11,6 +11,8 @@ void Dkc1WindowsGraphicsDraw(const uint32_t *pixels,int w,int h,int display_widt
 /* Presents an HD texture surface of w x h pixels as a logical
  * display_width x logical_height picture (dkc1_hd.c). */
 void Dkc1WindowsGraphicsDrawHd(const uint32_t *pixels,int w,int h,int display_width,int logical_height);
+struct Dkc1HdGpuInputs;
+bool Dkc1WindowsGraphicsDrawHdGpu(const struct Dkc1HdGpuInputs *inputs,int display_width,int logical_height);
 void Dkc1WindowsGraphicsSwap(void);
 void Dkc1WindowsGraphicsClose(void);
 int Dkc1WindowsGraphicsTest(void);

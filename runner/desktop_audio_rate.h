@@ -11,18 +11,20 @@
  * fraction of a percent, chosen from how full the queue is, keeps the queue
  * near a target. The small adjustment can change pitch. */
 
+enum { DKC1_AUDIO_STRETCH_TAPS = 16 };
+
 typedef struct Dkc1AudioStretch {
-  double position; /* fractional read position past the kept frame */
-  int16_t last[2]; /* the previous call's final stereo frame */
+  double position; /* fractional read position into the kept frames */
+  int16_t last[DKC1_AUDIO_STRETCH_TAPS][2]; /* the previous call's tail */
   bool primed;
 } Dkc1AudioStretch;
 
 void Dkc1AudioStretchReset(Dkc1AudioStretch *stretch);
 
 /* Resample stereo 16-bit frames by ratio (output frames per input frame)
- * with linear interpolation, continuous across calls. Returns the number of
- * output frames written, at most out_capacity. A ratio of exactly 1.0
- * reproduces the input one frame late. The caller must provide capacity for
+ * with a 16-tap windowed-sinc filter, continuous across calls. Returns the
+ * number of output frames written, at most out_capacity. A ratio of
+ * exactly 1.0 reproduces the input unchanged, eight frames late. The caller must provide capacity for
  * ceil(in_frames * ratio) + 2; this API does not retain truncated input. */
 int Dkc1AudioStretchProcess(Dkc1AudioStretch *stretch, double ratio,
                             const int16_t *in, int in_frames, int16_t *out,

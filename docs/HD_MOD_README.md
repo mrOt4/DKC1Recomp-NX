@@ -36,7 +36,7 @@ DKC1_HD_DUMP=~/dkc1-hd/dump DKC1_WIDESCREEN=1 \
 DKC1_SCRIPT=recipes/hd_dump_jungle.dks \
   build/dkc1_snesrecomp_headless "/ruta/Donkey Kong Country (USA).sfc" 20000
 
-# 2. Escalar, cuantizar a la paleta original y escribir el pack. Necesita
+# 2. Escalar, ajustar a la paleta original y escribir el pack. Necesita
 #    realesrgan-ncnn-vulkan (releases de xinntao/Real-ESRGAN) y una GPU Vulkan.
 python tools/hd_pack.py --dump ~/dkc1-hd/dump \
   --rom "/ruta/Donkey Kong Country (USA).sfc" \
@@ -57,7 +57,16 @@ python tools/hd_pack.py --dump ~/dkc1-hd/dumps/* --rom "/ruta/...sfc" \
 ```
 
 Valores por defecto de la receta "DKC1 HD Remaster": modelo
-`realesr-animevideov3`, escala 4, `--detail 0.35`, `--dither 0.7`.
+`realesr-animevideov3`, `--scales 4,2` (escribe `tiles.bin` a 4× y
+`tiles-2x.bin` a 2×, este reducido por media de área del resultado del
+modelo), `--detail 0`.
+
+Cada píxel HD se guarda como **dos colores de la paleta del tile y un peso
+de mezcla** (formato v2, `DKC1HDP2`). Los degradados y los bordes caen entre
+colores de la paleta sin tramado, y los bordes de los sprites se funden con
+lo que hay debajo. Como los colores se leen de la CGRAM del momento, los
+fundidos y las animaciones de paleta siguen funcionando. Los packs del
+formato anterior (v1) se rechazan con un mensaje: hay que regenerarlos.
 
 Cuantas más rutas o partidas vuelques en el paso 1, más cobertura tendrá el
 pack. Los tiles que falten se dibujan con el píxel original (o con el filtro
@@ -75,6 +84,8 @@ prioridad sobre lo guardado.
 
 **Switch**: copia la carpeta del pack a `sdmc:/switch/dkc1/hd/` (debe quedar
 `sdmc:/switch/dkc1/hd/pack.json`). Si existe, el mod se activa al arrancar.
+La Switch compone a 2× y carga `tiles-2x.bin` (unos 33 MB); `tiles.bin`
+(4×) no hace falta copiarlo.
 
 **Variables de entorno** (QA y pruebas deterministas):
 
@@ -87,7 +98,8 @@ prioridad sobre lo guardado.
 | `DKC1_HD_DUMP=/ruta` | Modo volcado para generar packs. |
 | `DKC1_HD_PPM`, `DKC1_HD_GBUF` | (headless) Guardan el último frame HD / el G-buffer. |
 | `DKC1_HD_THREADS=N` | Hilos del compositor (por defecto, hasta 4; 1 = un solo hilo). |
-| `DKC1_HD_DEBLOCK=0` | Desactiva el suavizado de costuras entre tiles. |
+| `DKC1_HD_SCALE=1/2/4` | Escala de composición; carga `tiles-<N>x.bin` si existe (Switch: 2 por defecto). |
+| `DKC1_HD_GPU_VERIFY=1` | (Windows) Compara cada frame compuesto en GPU con la composición en CPU. |
 
 El HD solo se activa en widescreen (16:10 o 16:9). En 4:3 el juego se ve
 siempre como el original.

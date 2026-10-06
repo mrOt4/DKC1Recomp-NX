@@ -2,6 +2,7 @@
 
 #include <math.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 static int g_failures;
 
@@ -29,11 +30,11 @@ static void TestUnityRatioIsTransparent(void) {
   int16_t in[kFrames * 2];
   int16_t out[kCapacity * 2];
   FillRamp(in, kFrames, 0);
-  /* Interpolation keeps the final input frame for the next call, so the
-   * first call is one frame short and the stream runs one frame late. */
+  /* The filter needs eight frames beyond the output point, so the first
+   * call is eight frames short and the stream runs eight frames late. */
   int written = Dkc1AudioStretchProcess(&stretch, 1.0, in, kFrames, out,
                                         kCapacity);
-  EXPECT(written == kFrames - 1);
+  EXPECT(written == kFrames - 8);
   for (int i = 0; i < written; i++) {
     EXPECT(out[i * 2] == in[i * 2]);
     EXPECT(out[i * 2 + 1] == in[i * 2 + 1]);
@@ -43,8 +44,8 @@ static void TestUnityRatioIsTransparent(void) {
   written = Dkc1AudioStretchProcess(&stretch, 1.0, in, kFrames, out,
                                     kCapacity);
   EXPECT(written == kFrames);
-  EXPECT(out[0] == kFrames - 1);
-  EXPECT(out[(written - 1) * 2] == 2 * kFrames - 2);
+  EXPECT(out[0] == kFrames - 8);
+  EXPECT(out[(written - 1) * 2] == 2 * kFrames - 9);
 }
 
 static void TestStretchChangesCountAndStaysContinuous(void) {
@@ -59,12 +60,12 @@ static void TestStretchChangesCountAndStaysContinuous(void) {
     FillRamp(in, kFrames, call * kFrames);
     int written = Dkc1AudioStretchProcess(&stretch, 1.005, in, kFrames, out,
                                           kCapacity);
-    EXPECT(written >= kFrames + 1 && written <= kFrames + 3);
+    EXPECT(written >= kFrames - 6 && written <= kFrames + 3);
     for (int i = 0; i < written; i++) {
-      /* A ramp stays monotonic through interpolation and across calls, and
-       * each channel keeps its own sign. */
-      EXPECT(out[i * 2] >= previous);
-      EXPECT(out[i * 2 + 1] == -out[i * 2]);
+      /* A ramp stays monotonic through interpolation and across calls
+       * (within rounding), and each channel keeps its own sign. */
+      EXPECT(out[i * 2] >= previous - 1);
+      EXPECT(abs(out[i * 2 + 1] + out[i * 2]) <= 1);
       previous = out[i * 2];
     }
     total += written;
@@ -77,7 +78,7 @@ static void TestStretchChangesCountAndStaysContinuous(void) {
     FillRamp(in, kFrames, call * kFrames);
     int written = Dkc1AudioStretchProcess(&stretch, 0.995, in, kFrames, out,
                                           kCapacity);
-    EXPECT(written >= kFrames - 4 && written <= kFrames - 2);
+    EXPECT(written >= kFrames - 12 && written <= kFrames - 2);
     total += written;
   }
   EXPECT(fabs((double)total / (40.0 * kFrames) - 0.995) < 0.0005);
@@ -96,7 +97,7 @@ static void TestStretchHonoursCapacityAndBadInput(void) {
   /* A non-positive ratio is treated as unity rather than looping forever. */
   Dkc1AudioStretchReset(&stretch);
   EXPECT(Dkc1AudioStretchProcess(&stretch, 0.0, in, kFrames, out, kCapacity) ==
-         kFrames - 1);
+         kFrames - 8);
 }
 
 static void TestRateRatio(void) {

@@ -69,7 +69,21 @@ class NativeHapticsMsu1ContractTests(unittest.TestCase):
         self.assertIn("player->track->mapping + offset", msu)
         self.assertIn("for (unsigned track = 1; track <= kMsuTrackCount",
                       msu)
-        self.assertNotIn("fread(", msu)
+        # Compressed tracks are read whole and decoded by the stream worker;
+        # the frame-critical mixer only copies decoded frames from its ring.
+        self.assertEqual(msu.count("fread("), 1)
+        loader = msu.index("static uint8_t *LoadWholeFile(")
+        self.assertGreater(msu.index("fread(", loader), loader)
+        self.assertLess(msu.index("fread(", loader),
+                        msu.index("static int SDLCALL StreamWorker("))
+        self.assertEqual(msu.count("LoadWholeFile("), 2)
+        worker = msu.index("static int SDLCALL StreamWorker(")
+        self.assertGreater(msu.index("LoadWholeFile(track->path", worker),
+                           worker)
+        mix = msu[msu.index("void Dkc1Msu1Mix("):
+                  msu.index("bool Dkc1Msu1WaitReady(")]
+        for forbidden in ("fopen(", "fread(", "stb_vorbis_", "SDL_Delay("):
+            self.assertNotIn(forbidden, mix)
 
     def test_mac_menu_exposes_music_pack_controls(self):
         picker = (ROOT / "runner" / "macos_file_picker.m").read_text(

@@ -1,8 +1,9 @@
 /* Compares an MSU-1 PCM pack with its compressed (tools/msu1_compress.py)
  * version through the real player (runner/dkc1_msu1.c).
  *
- *   cc -O2 -Irunner tests/test_msu1_pack.c runner/dkc1_msu1.c \
- *      runner/dkc1_stb_vorbis.c -lm -o build/test_msu1_pack
+ *   cc -O2 -Irunner $(sdl2-config --cflags) tests/test_msu1_pack.c \
+ *      runner/dkc1_msu1.c runner/dkc1_stb_vorbis.c \
+ *      $(sdl2-config --libs) -lm -o build/test_msu1_pack
  *   build/test_msu1_pack msu-1 msu-1-ogg
  *
  * Each track is mixed at 48 kHz from both packs and the outputs are
@@ -31,7 +32,8 @@ static int Play(const char *dir, unsigned track, long frames, int16_t *out) {
     return 0;
   }
   Dkc1Msu1ObserveMusicState(player, (uint16_t)(track - 1), 1);
-  if (Dkc1Msu1CurrentTrack(player) != track) {
+  if (Dkc1Msu1CurrentTrack(player) != track ||
+      !Dkc1Msu1WaitReady(player, 5000)) {
     Dkc1Msu1Close(player);
     return 0;
   }
