@@ -1,5 +1,11 @@
 
-# DKC1Recomp-NX 1.0.1
+# DKC1Recomp-NX 1.0.2
+
+[![Support me on Ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/mr0ta)
+
+If you enjoy this port, you can support it on
+[Ko-fi](https://ko-fi.com/mr0ta).
+
 This fork adds, on top of DKC1Recomp and its Switch port:
 
 - **Nintendo Switch at 60 fps**: own audren audio output, fixed 60 Hz frame
@@ -8,7 +14,8 @@ This fork adds, on top of DKC1Recomp and its Switch port:
   switches, cheats (infinite lives, Pro Action Replay codes) and a
   frame-time HUD. See [docs/SWITCH.md](docs/SWITCH.md).
 - **HD texture mod** generated from your own ROM (pack format v2: two
-  palette colors and a blend weight per HD pixel, composed on the GPU). See
+  palette colors and a blend weight per HD pixel, composed on the GPU,
+  with the 8x8 tile seams smoothed where the original art has none). See
   [docs/HD_MOD_README.md](docs/HD_MOD_README.md) and
   [docs/HD_REMASTER.md](docs/HD_REMASTER.md).
 - **Compressed MSU-1 music** (Ogg Vorbis, decoded on its own thread, with

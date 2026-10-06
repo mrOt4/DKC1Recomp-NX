@@ -24,7 +24,8 @@ PIXEL = np.dtype([("main_ref", "<u4"), ("sub_ref", "<u4"), ("under_ref", "<u4"),
                   ("cover_ref", "<u4"), ("main_index", "u1"),
                   ("sub_index", "u1"), ("flags", "u1"), ("main_layer", "u1"),
                   ("under_index", "u1"), ("cover_base", "u1"),
-                  ("under_layer", "u1"), ("cover_layer", "u1")])
+                  ("under_layer", "u1"), ("cover_layer", "u1"),
+                  ("sub_layer", "u1"), ("pad", "V3")])
 BUFFER_WIDTH = 448
 HEIGHT = 224
 

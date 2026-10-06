@@ -6,7 +6,9 @@
  *   1. compose - every HD subpixel: blend the texel's two palette colors,
  *                then the same color math and brightness as the CPU path
  *                (dkc1_hd.c FinishColor), in the same float operations;
- *   2. present - fit to the viewport (sharp bilinear up, 4 taps down).
+ *   2. deblock - spread the step across tile seams the CPU marked (the
+ *                same integer ramp as dkc1_hd.c DeblockFrame);
+ *   3. present - fit to the viewport (sharp bilinear up, 4 taps down).
  * DKC1_HD_GPU_VERIFY reads pass 1 back and compares it with the CPU.
  *
  * Built for the Switch's Tegra: one RGBA32UI input texel per native pixel
@@ -140,7 +142,10 @@ HD_GL_FUNCS(HD_DECLARE)
 #undef HD_DECLARE
 
 /* kPassNative aliases kPassPresent; every pass before it owns a program. */
-enum { kPassCompose, kPassPresent, kPassOverlay, kPassNative, kPassCount };
+enum {
+  kPassCompose, kPassDeblock, kPassPresent, kPassOverlay, kPassNative,
+  kPassCount
+};
 enum { kInputSets = 3, kAtlasTilesPerRow = 256 };
 
 typedef struct HdTarget {
@@ -161,7 +166,7 @@ static int s_overlay_width, s_overlay_height;
 static int s_native_width, s_native_height;
 static uint64_t s_atlas_generation;
 static int s_atlas_scale;
-static HdTarget s_target;
+static HdTarget s_target, s_deblocked;
 static int s_max_texture;
 
 static const char *const kVertex =
@@ -257,6 +262,42 @@ static const char *const kCompose =
     "  color = vec4(floor(expand5(m.r) * bright / 15.0),\n"
     "               floor(expand5(m.g) * bright / 15.0),\n"
     "               floor(expand5(m.b) * bright / 15.0), 255.0) / 255.0;\n"
+    "}\n";
+
+/* Deblock: z bits 26/29/30/31 mark a tile seam above/right/below/left of
+ * this native pixel; spread the HD step across it over one native pixel on
+ * each side (dkc1_hd.c Ramp and DeblockFrame, in integers). */
+static const char *const kDeblock =
+    "uniform highp usampler2D gtex;\n"
+    "uniform sampler2D srctex;\n"
+    "uniform ivec4 dims;  /* log2 scale, native width, native height, 0 */\n"
+    "out vec4 color;\n"
+    "ivec3 at(int x, int y) {\n"
+    "  return ivec3(floor(texelFetch(srctex, ivec2(x, y), 0).rgb * 255.0 + 0.5));\n"
+    "}\n"
+    "ivec3 ramp(ivec3 d, int i, int n) {\n"
+    "  ivec3 m = abs(d) * (n - i) / (2 * n + 1);\n"
+    "  return ivec3(d.x < 0 ? -m.x : m.x, d.y < 0 ? -m.y : m.y,\n"
+    "               d.z < 0 ? -m.z : m.z);\n"
+    "}\n"
+    "void main() {\n"
+    "  int sh = dims.x, s = 1 << sh;\n"
+    "  ivec2 p = ivec2(gl_FragCoord.xy);\n"
+    "  int nx = p.x >> sh, ny = p.y >> sh, u = p.x & (s - 1), v = p.y & (s - 1);\n"
+    "  uint z = texelFetch(gtex, ivec2(nx, ny), 0).z;\n"
+    "  ivec3 c = at(p.x, p.y);\n"
+    "  if ((z & 0xe4000000u) != 0u) {\n"
+    "    int x0 = nx << sh, y0 = ny << sh;\n"
+    "    if ((z & (1u << 29)) != 0u)\n"
+    "      c += ramp(at(x0 + s, p.y) - at(x0 + s - 1, p.y), s - 1 - u, s);\n"
+    "    if ((z & (1u << 31)) != 0u)\n"
+    "      c -= ramp(at(x0, p.y) - at(x0 - 1, p.y), u, s);\n"
+    "    if ((z & (1u << 30)) != 0u)\n"
+    "      c += ramp(at(p.x, y0 + s) - at(p.x, y0 + s - 1), s - 1 - v, s);\n"
+    "    if ((z & (1u << 26)) != 0u)\n"
+    "      c -= ramp(at(p.x, y0) - at(p.x, y0 - 1), v, s);\n"
+    "  }\n"
+    "  color = vec4(vec3(clamp(c, 0, 255)) / 255.0, 1.0);\n"
     "}\n";
 
 /* Present: the composed frame (or the native frame when `swizzle` is set,
@@ -373,6 +414,7 @@ bool Dkc1HdGpuInit(bool gles) {
         "precision highp usampler2D;\nprecision highp sampler2D;\n"
       : "#version 330 core\n";
   s_programs[kPassCompose] = Program(header, kCompose, NULL);
+  s_programs[kPassDeblock] = Program(header, kDeblock, NULL);
   s_programs[kPassPresent] = Program(header, kPresent, NULL);
   s_programs[kPassOverlay] = Program(header, kOverlay, NULL);
   s_programs[kPassNative] = s_programs[kPassPresent];
@@ -574,6 +616,21 @@ bool Dkc1HdGpuCompose(const Dkc1HdGpuInputs *in) {
   glUniform1i(glGetUniformLocation(program, "flip_uv"), 0);
   glDrawArrays(HD_GL_TRIANGLE_STRIP, 0, 4);
   s_last = &s_target;
+  if (in->deblock) {
+    if (!EnsureTarget(&s_deblocked, s_target.width, s_target.height))
+      return false;
+    Bind(0, s_g[set], false);
+    Bind(5, s_target.texture, false);
+    glBindFramebuffer(HD_GL_FRAMEBUFFER, s_deblocked.framebuffer);
+    glViewport(0, 0, s_deblocked.width, s_deblocked.height);
+    const GLuint deblock = s_programs[kPassDeblock];
+    glUseProgram(deblock);
+    glUniform4i(glGetUniformLocation(deblock, "dims"), Log2Scale(in->scale),
+                in->width, in->height, 0);
+    glUniform1i(glGetUniformLocation(deblock, "flip_uv"), 0);
+    glDrawArrays(HD_GL_TRIANGLE_STRIP, 0, 4);
+    s_last = &s_deblocked;
+  }
   return glGetError() == HD_GL_NO_ERROR;
 }
 
@@ -668,6 +725,9 @@ void Dkc1HdGpuShutdown(void) {
   glDeleteFramebuffers(1, &s_target.framebuffer);
   glDeleteTextures(1, &s_target.texture);
   memset(&s_target, 0, sizeof s_target);
+  glDeleteFramebuffers(1, &s_deblocked.framebuffer);
+  glDeleteTextures(1, &s_deblocked.texture);
+  memset(&s_deblocked, 0, sizeof s_deblocked);
   glDeleteTextures(kInputSets, s_g);
   glDeleteTextures(kInputSets, s_lines);
   memset(s_g, 0, sizeof s_g);

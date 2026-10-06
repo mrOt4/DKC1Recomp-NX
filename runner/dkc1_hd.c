@@ -44,6 +44,8 @@ static size_t s_out_capacity;
 
 static Dkc1HdStats s_stats;
 static bool s_debug_misses;  /* DKC1_HD_DEBUG=misses: tint pack misses */
+static bool s_deblock = true;  /* DKC1_HD_DEBLOCK=0 disables */
+static int kHdSeamNativeStep = 96;
 /* Track the layers under/over each pixel so HD silhouettes can differ from
  * the native ones. DKC1_HD_SHAPE=0 keeps native silhouettes (cheaper). */
 static bool s_shape = true;
@@ -337,6 +339,10 @@ void Dkc1HdInitializeFromEnvironment(void) {
 #endif
   const char *debug = getenv("DKC1_HD_DEBUG");
   s_debug_misses = debug && strcmp(debug, "misses") == 0;
+  const char *deblock = getenv("DKC1_HD_DEBLOCK");
+  s_deblock = !deblock || *deblock != '0';
+  if (getenv("DKC1_HD_SEAM_STEP"))
+    kHdSeamNativeStep = atoi(getenv("DKC1_HD_SEAM_STEP"));
   const char *shape = getenv("DKC1_HD_SHAPE");
   s_shape = !shape || *shape != '0';
   if (debug && strcmp(debug, "grid") == 0) {
@@ -1218,6 +1224,147 @@ static void ComposeRows(Ppu *ppu, int width, int y0, int y1,
   }
 }
 
+/* ---- Tile-seam deblocking ----------------------------------------------
+ * The pack stores one HD version per character, upscaled in one context;
+ * the same character sits next to different neighbours elsewhere, and the
+ * upscale's smooth interior makes the 8x8 edges stand out where the native
+ * art's grain hid them. Where two pixels of the same layer meet across a
+ * tile edge and the native picture has no real edge there (each channel
+ * within kHdSeamNativeStep), the HD step across the edge is spread over a
+ * ramp of one native pixel on each side. SeamBits marks the edges of every
+ * native pixel; CPU (DeblockFrame) and GPU (deblock pass) apply the same
+ * integer ramp, horizontal and vertical both from the composed frame. */
+enum {
+  kHdSeamUp = 1, kHdSeamRight = 2, kHdSeamDown = 4, kHdSeamLeft = 8,
+};
+
+static FORCEINLINE bool NativeClose(uint32_t a, uint32_t b) {
+  for (int shift = 0; shift < 24; shift += 8) {
+    const int d = (int)((a >> shift) & 255) - (int)((b >> shift) & 255);
+    if (d > kHdSeamNativeStep || d < -kHdSeamNativeStep)
+      return false;
+  }
+  return true;
+}
+
+/* Is there a seam between pixel a and the next pixel b (to its right, or
+ * below when `vertical`)? */
+static bool SeamBetween(const uint16_t *vram, const PpuIdentityPixel *a,
+                        const PpuIdentityPixel *b, uint32_t native_a,
+                        uint32_t native_b, bool vertical) {
+  unsigned sa, sb;
+  if (vertical) {
+    sa = a->main_ref & 7;
+    sb = b->main_ref & 7;
+    if (a->main_ref & kPpuIdentRef_VFlip) sa = 7 - sa;
+    if (b->main_ref & kPpuIdentRef_VFlip) sb = 7 - sb;
+  } else {
+    sa = (a->main_ref >> kPpuIdentRef_ColShift) & 7;
+    sb = (b->main_ref >> kPpuIdentRef_ColShift) & 7;
+    if (a->main_ref & kPpuIdentRef_HFlip) sa = 7 - sa;
+    if (b->main_ref & kPpuIdentRef_HFlip) sb = 7 - sb;
+  }
+  if (sa != 7 || sb != 0)
+    return false;
+  const uint8_t need = kPpuIdentFlag_Composed;
+  if ((a->flags & (need | kPpuIdentFlag_Black)) != need ||
+      (b->flags & (need | kPpuIdentFlag_Black)) != need)
+    return false;
+  if (!(a->main_ref & kPpuIdentRef_Valid) ||
+      !(b->main_ref & kPpuIdentRef_Valid) || a->main_layer != b->main_layer)
+    return false;
+  /* Both sides HD: a character missing from the pack stays native pixels,
+   * whose edges are the art's own. */
+  return NativeClose(native_a, native_b) &&
+         PackTileIndex(vram, a->main_ref) >= 0 &&
+         PackTileIndex(vram, b->main_ref) >= 0;
+}
+
+static unsigned SeamBits(const Ppu *ppu, int width, int x, int y) {
+  const PpuIdentityPixel *row = &s_gbuf[(size_t)y * kPpuBufWidth];
+  const uint32_t *native = (const uint32_t *)(ppu->renderBuffer +
+                                              (size_t)y * ppu->renderPitch);
+  unsigned bits = 0;
+  if (x + 1 < width &&
+      SeamBetween(ppu->vram, &row[x], &row[x + 1], native[x], native[x + 1],
+                  false))
+    bits |= kHdSeamRight;
+  if (x > 0 &&
+      SeamBetween(ppu->vram, &row[x - 1], &row[x], native[x - 1], native[x],
+                  false))
+    bits |= kHdSeamLeft;
+  if (y + 1 < kHdHeight) {
+    const uint32_t *below = (const uint32_t *)((const uint8_t *)native +
+                                               ppu->renderPitch);
+    if (SeamBetween(ppu->vram, &row[x], &row[x + kPpuBufWidth], native[x],
+                    below[x], true))
+      bits |= kHdSeamDown;
+  }
+  if (y > 0) {
+    const uint32_t *above = (const uint32_t *)((const uint8_t *)native -
+                                               ppu->renderPitch);
+    if (SeamBetween(ppu->vram, &row[x - kPpuBufWidth], &row[x], above[x],
+                    native[x], true))
+      bits |= kHdSeamUp;
+  }
+  return bits;
+}
+
+/* RampSeam: shift = d * (n - i) / (2n + 1), truncated toward zero. */
+static FORCEINLINE int Ramp(int d, int i, int n) {
+  const int m = (d < 0 ? -d : d) * (n - i) / (2 * n + 1);
+  return d < 0 ? -m : m;
+}
+
+static void DeblockFrame(const Ppu *ppu, int width) {
+  const int s = s_scale, w = s_out_width;
+  static uint32_t *source;
+  static size_t capacity;
+  const size_t pixels = (size_t)w * s_out_height;
+  if (pixels > capacity) {
+    uint32_t *grown = realloc(source, pixels * sizeof *grown);
+    if (!grown)
+      return;
+    source = grown;
+    capacity = pixels;
+  }
+  memcpy(source, s_out, pixels * sizeof *source);
+  for (int y = 0; y < kHdHeight; y++) {
+    for (int x = 0; x < width; x++) {
+      const unsigned bits = SeamBits(ppu, width, x, y);
+      if (!bits)
+        continue;
+      for (int v = 0; v < s; v++) {
+        const int py = y * s + v;
+        for (int u = 0; u < s; u++) {
+          const int px = x * s + u;
+          const uint32_t c = source[(size_t)py * w + px];
+          int out[3];
+          for (int k = 0; k < 3; k++) {
+            const int shift = 16 - 8 * k;
+            int value = (int)((c >> shift) & 255);
+#define AT(X, Y) ((int)((source[(size_t)(Y) * w + (X)] >> shift) & 255))
+            if (bits & kHdSeamRight)
+              value += Ramp(AT((x + 1) * s, py) - AT((x + 1) * s - 1, py),
+                            s - 1 - u, s);
+            if (bits & kHdSeamLeft)
+              value -= Ramp(AT(x * s, py) - AT(x * s - 1, py), u, s);
+            if (bits & kHdSeamDown)
+              value += Ramp(AT(px, (y + 1) * s) - AT(px, (y + 1) * s - 1),
+                            s - 1 - v, s);
+            if (bits & kHdSeamUp)
+              value -= Ramp(AT(px, y * s) - AT(px, y * s - 1), v, s);
+#undef AT
+            out[k] = value < 0 ? 0 : value > 255 ? 255 : value;
+          }
+          s_out[(size_t)py * w + px] =
+              (uint32_t)out[0] << 16 | (uint32_t)out[1] << 8 | (uint32_t)out[2];
+        }
+      }
+    }
+  }
+}
+
 /* ---- GPU composition inputs (dkc1_hd_gpu.c) -------------------------------
  * The same per-pixel decisions as ComposeRows' pack path, one RGBA32UI
  * texel per native pixel:
@@ -1226,7 +1373,9 @@ static void ComposeRows(Ppu *ppu, int width, int y0, int y1,
  *                  2bpp << 25
  *   x = main ref  | flags bits 0-4 << 27
  *   y = cover ref | flags bits 5-7 << 27 | below-known << 30
- *   z = sub ref (none unless the sub-screen texel shows) | mode << 27
+ *   z = sub ref (none unless the sub-screen texel shows) | mode << 27 |
+ *       tile seams (deblocking): up << 26, right << 29, down << 30,
+ *       left << 31
  *   w = main index | sub index << 8 | under index << 16 | cover base << 24,
  *       or for a native-mode pixel its 0x00RRGGBB color
  * Line rows: CGRAM[256], fixed color, brightness. */
@@ -1335,8 +1484,13 @@ static void EncodeGpuRows(Ppu *ppu, int width, int y0, int y1,
       g[0] = GpuRef(gp->main_ref, main_index) | (flags & 31u) << 27;
       g[1] = GpuRef(gp->cover_ref, cover_index) | ((flags >> 5) & 7u) << 27 |
              (below_known ? 1u << 30 : 0);
+      const unsigned seams = SeamBits(ppu, width, x, y);
       g[2] = GpuRef(gp->sub_ref, sub_index) |
-             (uint32_t)kDkc1HdGpuModeCompose << 27;
+             (uint32_t)kDkc1HdGpuModeCompose << 27 |
+             ((seams & kHdSeamUp) ? 1u << 26 : 0) |
+             ((seams & kHdSeamRight) ? 1u << 29 : 0) |
+             ((seams & kHdSeamDown) ? 1u << 30 : 0) |
+             ((seams & kHdSeamLeft) ? 1u << 31 : 0);
       g[3] = gp->main_index | (uint32_t)gp->sub_index << 8 |
              (uint32_t)gp->under_index << 16 | (uint32_t)gp->cover_base << 24;
     }
@@ -1575,6 +1729,8 @@ static void RunBands(Ppu *ppu, int width, bool gpu) {
 
 static void ComposeFrame(Ppu *ppu, int width) {
   RunBands(ppu, width, false);
+  if (s_source == kDkc1HdSourcePack && s_deblock)
+    DeblockFrame(ppu, width);
 }
 
 void Dkc1HdFinishFrame(Ppu *ppu, int width) {
@@ -1607,6 +1763,7 @@ void Dkc1HdFinishFrame(Ppu *ppu, int width) {
       .tiles = s_pack.tiles,
       .tile_count = s_pack.count,
       .tiles_generation = s_pack.generation,
+      .deblock = s_deblock,
     };
     if (s_gpu_verify) {
       /* Reference CPU composition of the same frame for comparison. */

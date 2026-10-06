@@ -1330,6 +1330,7 @@ static void VerifyGpuComposition(void) {
   /* Both sides blend in float; a GPU may fuse a multiply-add and land one
    * level off after flooring, so allow 1 per channel. */
   uint64_t differ = 0;
+  int frame_worst = 0;
   for (size_t i = 0; i < (size_t)cw * ch; i++) {
     int worst = 0;
     for (int shift = 0; shift < 24; shift += 8) {
@@ -1338,15 +1339,16 @@ static void VerifyGpuComposition(void) {
       if (abs(d) > worst) worst = abs(d);
     }
     differ += worst > 1;
+    if (worst > frame_worst) frame_worst = worst;
   }
   frames++;
   frames_differ += differ != 0;
   pixels_differ += differ;
   if (frames % 120 == 0 || differ)
     fprintf(stderr, "[hd-gpu-verify] frames=%ld frames_differ=%ld "
-            "pixels_differ=%llu (last %llu of %dx%d)\n", frames,
+            "pixels_differ=%llu (last %llu of %dx%d, worst %d)\n", frames,
             frames_differ, (unsigned long long)pixels_differ,
-            (unsigned long long)differ, cw, ch);
+            (unsigned long long)differ, cw, ch, frame_worst);
 }
 #endif
 

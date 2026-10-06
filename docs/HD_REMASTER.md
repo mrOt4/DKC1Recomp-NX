@@ -133,6 +133,35 @@ Rediseño:
   modelo. Antes, la Switch reducía el pack 4× al cargar tomando un texel de
   cada cuatro.
 
+### Juntas entre tiles en el compositor v2 (1.0.2, 2026-10-06)
+
+Sin *deblocking*, el pack v2 dejaba una cuadrícula visible en fondos de
+grano fino (follaje de Jungle Hijinxs): cada carácter se amplía en un solo
+contexto y su interior suave hace evidentes los bordes de 8×8.
+
+- **Marcado en CPU** (`SeamBits`, `dkc1_hd.c`): hay junta entre dos píxeles
+  vecinos cuando son la columna/fila 7 y 0 de sus tiles (respetando el
+  volteo), de la misma capa principal, ambos compuestos y no negros, los dos
+  caracteres están en el pack y el salto nativo es ≤ 96 por canal. Un
+  carácter sin versión HD conserva sus bordes de píxel. Los cuatro bits
+  (arriba, derecha, abajo, izquierda) viajan en los bits 26, 29, 30 y 31 del
+  canal `z` de la textura de entrada, sin subir datos nuevos.
+- **Pase de GPU** (`kDeblock`, `dkc1_hd_gpu.c`) tras la composición: reparte
+  el salto HD a través de la junta en una rampa de un píxel nativo a cada
+  lado, `d·(n−i)/(2n+1)` en enteros. `DeblockFrame` hace lo mismo en CPU.
+  `DKC1_HD_DEBLOCK=0` lo desactiva.
+- **Medidas** (`tools/hd_seams.py`, 4×, antes → después): jungla 2,09 → 0,63,
+  segunda jungla 2,19 → 0,60, fábrica 1,84 → 0,45, cueva 1,96 → 0,72, agua
+  1,18 → 0,47; jungla a 2× (Switch) 1,52 → 0,55. Umbral nativo probado:
+  24 deja la cuadrícula (1,43), 96 la quita sin suavizar bordes reales
+  (escaleras, personajes, siluetas contra el cielo entre capas distintas).
+- **GPU frente a CPU** (Wine, GL 3.3, 240 frames de jungla y de fábrica):
+  igual que sin *deblocking*, 1 y 0 píxeles con diferencia mayor que 1.
+  Probado en Switch: 60 fps.
+- Descartado: retroproyectar en `hd_pack.py` (que cada bloque HD promedie el
+  color nativo) no reduce las juntas (2,09 → 2,12) y cambiaría el pack.
+- El pack no cambia: los packs de 1.0.0 y 1.0.1 sirven tal cual.
+
 Objetivo: sustituir la imagen de tiles, sprites y fondos por versiones en alta
 resolución **solo en la presentación**. La CPU recompilada, la WRAM, la VRAM,
 la CGRAM, la OAM, la colisión, la física y los guardados no cambian, y el

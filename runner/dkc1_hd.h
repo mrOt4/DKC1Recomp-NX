@@ -92,6 +92,7 @@ typedef struct Dkc1HdGpuInputs {
   const uint16_t *tiles;     /* tile_count tiles of (8*scale)^2 texels */
   uint32_t tile_count;
   uint64_t tiles_generation; /* re-upload the atlas when this changes */
+  bool deblock;              /* run the tile-seam deblock pass */
 } Dkc1HdGpuInputs;
 
 void Dkc1HdSetGpuComposition(bool enabled);
