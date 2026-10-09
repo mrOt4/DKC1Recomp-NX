@@ -2074,31 +2074,226 @@ static bool Dkc1DebugForceWidescreenFallback(void) {
          requested == snes_frame_counter;
 }
 
-/* DKC1 draws its counters (banana counter, lives counter) into the first
- * OAM slots, ahead of every object, and only while one is shown; the same
- * slots hold ordinary objects otherwise. Count that leading run of HUD
- * sprites by their tiles: the spinning banana (names $1E0-$1EF, palette 0),
- * the digits ($60-$7F, palette 0) and the Kong heads ($E0-$E3 DK, $1C0-$1C3
- * Diddy, palette 1), all in the top band. The run ends at the first other
- * sprite. Measured on the jungle and death routes. */
-static int Dkc1HudOamPrefix(const Ppu *ppu) {
+/* DKC1 draws its counters (banana counter, lives counter) into low OAM
+ * slots, but not always together or first: collected or placed bananas and
+ * other objects can take slots ahead of or between them. Each counter
+ * sprite is anchored on its own (PpuSetWsHudOamMask), so a counter moves as
+ * a whole however the game interleaves it.
+ *
+ * The digits ($60-$7F, palette 0, unflipped, in the top band) are the
+ * anchor: the banana counter's on the left (x < 96), the lives counter's on
+ * the right (x >= 160). The icon beside them is found by place, not by tile
+ * number, since a level can load the Kong balloon's graphics elsewhere in
+ * VRAM (Jungle Hijinxs: $E0-$E3; the snow levels: $120-$123): the balloon
+ * is any unflipped palette-1 sprite of the top band within 40 pixels left of
+ * the lives digits, the banana any unflipped palette-0 sprite within 24
+ * pixels left of the banana digits. Measured on the 40-entrance bench. */
+enum { kHudScanSlots = 32, kHudBandHeight = 40 };
+
+static bool Dkc1HudDigit(uint16_t pos, uint16_t data) {
+  const unsigned y = pos >> 8;
+  const unsigned name = (data & 0xff) | ((data >> 8) & 1u) << 8;
+  return y < kHudBandHeight && ((data >> 8) & 0xce) == 0x00 &&
+         name >= 0x60 && name <= 0x7f;
+}
+
+/* Fills the anchor set; returns how many slots it holds. */
+static int Dkc1HudOamMask(const Ppu *ppu, uint8_t mask[16]) {
   int count = 0;
-  for (; count < 16; count++) {
-    const uint16_t pos = ppu->oam[count * 2];
-    const uint16_t data = ppu->oam[count * 2 + 1];
-    const unsigned y = pos >> 8;
-    const unsigned name = (data & 0xff) | ((data >> 8) & 1u) << 8;
-    const unsigned attr = (data >> 8) & 0xfe;  /* priority, palette, flips */
-    if (y >= 48)
-      break;
-    const bool banana = attr == 0x30 && name >= 0x1e0 && name <= 0x1ef;
-    const bool digit = attr == 0x30 && name >= 0x60 && name <= 0x7f;
-    const bool head = attr == 0x32 && ((name >= 0xe0 && name <= 0xe3) ||
-                                       (name >= 0x1c0 && name <= 0x1c3));
-    if (!banana && !digit && !head)
-      break;
+  int left_digits = 256, right_digits = 256;  /* leftmost digit x per side */
+  memset(mask, 0, 16);
+  for (int slot = 0; slot < kHudScanSlots; slot++) {
+    const uint16_t pos = ppu->oam[slot * 2], data = ppu->oam[slot * 2 + 1];
+    if (!Dkc1HudDigit(pos, data))
+      continue;
+    const int x = pos & 0xff;
+    if (x < 96) {
+      if (x < left_digits) left_digits = x;
+    } else if (x >= 160) {
+      if (x < right_digits) right_digits = x;
+    } else {
+      continue;
+    }
+    mask[slot >> 3] |= (uint8_t)(1u << (slot & 7));
+    count++;
+  }
+  for (int slot = 0; slot < kHudScanSlots; slot++) {
+    if (mask[slot >> 3] & (1u << (slot & 7)))
+      continue;
+    const uint16_t pos = ppu->oam[slot * 2], data = ppu->oam[slot * 2 + 1];
+    const int x = pos & 0xff, y = pos >> 8;
+    const unsigned attr = (data >> 8) & 0xce;  /* flips and palette */
+    const bool balloon = right_digits < 256 && attr == 0x02 &&
+                         y < kHudBandHeight && x >= right_digits - 40 &&
+                         x < right_digits;
+    const bool banana = left_digits < 256 && attr == 0x00 && y < 24 &&
+                        x >= left_digits - 24 && x < left_digits;
+    if (balloon || banana) {
+      mask[slot >> 3] |= (uint8_t)(1u << (slot & 7));
+      count++;
+    }
   }
   return count;
+}
+
+/* ---- Scanline bands ---------------------------------------------------
+ * The 224 visible lines are independent once each starts from the PPU
+ * state the previous lines' HDMA left behind. DrawLinesInBands records the
+ * frame's HDMA register writes first, then draws bands of lines on the HD
+ * worker pool: every band starts from a copy of the PPU after line 0 and
+ * replays the writes before its first line, so it sees exactly the state
+ * the sequential loop would. The caller's band draws on g_ppu, which then
+ * takes the remaining writes, ending in the sequential loop's register
+ * state; per-line draw state (sprite overflow flags, the identity line
+ * generation) is merged back. Output rows, identity rows and identity
+ * lines are per line, so bands never share a byte. Default on Switch only
+ * (DKC1_PPU_BANDS=0/1 overrides), where the capture for the HD mod costs
+ * the emulation core several milliseconds per frame. */
+enum { kBandLines = 225, kBandMaxWrites = 8 * 4, kBandMaxThreads = 8 };
+
+typedef struct BandLineWrites {
+  uint8_t count;
+  uint8_t regs[kBandMaxWrites], values[kBandMaxWrites];
+} BandLineWrites;
+
+static BandLineWrites s_band_writes[kBandLines];
+static Ppu *s_band_base;
+static Ppu *s_band_ppu[kBandMaxThreads];
+static struct {
+  int bias;
+  bool forget;  /* this frame's identity generations wrap */
+  int first[kBandMaxThreads + 1];  /* band i draws [first[i], first[i+1]) */
+  bool range_over[kBandMaxThreads], time_over[kBandMaxThreads];
+} s_band;
+
+static void RunBiasedLine(Ppu *ppu, int line, int bias) {
+  if (bias) {
+    for (int layer = 0; layer < 4; layer++)
+      ppu->hScroll[layer] = (uint16_t)(ppu->hScroll[layer] + bias);
+  }
+  ppu_runLine(ppu, line);
+  if (bias) {
+    for (int layer = 0; layer < 4; layer++)
+      ppu->hScroll[layer] = (uint16_t)(ppu->hScroll[layer] - bias);
+  }
+}
+
+static void ApplyLineWrites(Ppu *ppu, int line) {
+  const BandLineWrites *w = &s_band_writes[line];
+  for (int i = 0; i < w->count; i++)
+    ppu_write(ppu, w->regs[i], w->values[i]);
+}
+
+/* The identity generation as the sequential loop leaves it after `lines`
+ * more drawn lines (ppu_runLine skips 0 on wrap). */
+static uint16_t AdvanceIdentGen(uint16_t gen, int lines) {
+  for (int i = 0; i < lines; i++)
+    if (++gen == 0)
+      gen = 1;
+  return gen;
+}
+
+static void DrawBand(void *context, int index, int count) {
+  (void)context;
+  (void)count;
+  const int first = s_band.first[index], end = s_band.first[index + 1];
+  Ppu *ppu = g_ppu;
+  if (index > 0) {
+    if (s_band.forget)
+      PpuIdentityForgetThread();
+    ppu = s_band_ppu[index];
+    memcpy(ppu, s_band_base, sizeof *ppu);
+    for (int line = 0; line < first; line++)
+      ApplyLineWrites(ppu, line);
+    if (ppu->identPixels)
+      ppu->identGen = AdvanceIdentGen(ppu->identGen, first - 1);
+  } else {
+    ApplyLineWrites(ppu, 0);
+  }
+  for (int line = first; line < end; line++) {
+    RunBiasedLine(ppu, line, s_band.bias);
+    ApplyLineWrites(ppu, line);
+  }
+  s_band.range_over[index] = ppu->rangeOver;
+  s_band.time_over[index] = ppu->timeOver;
+}
+
+static bool PpuBandsEnabled(void) {
+  static int enabled = -1;
+  if (enabled < 0) {
+    const char *text = getenv("DKC1_PPU_BANDS");
+#ifdef __SWITCH__
+    enabled = !(text && *text == '0');
+#else
+    enabled = text && *text == '1';
+#endif
+  }
+  return enabled != 0;
+}
+
+static bool DrawLinesInBands(SimpleHdma *channels, const bool *active,
+                             int bias, bool forget) {
+  if (!PpuBandsEnabled() || g_ppu->wsMode2CaptureLayer)
+    return false;
+  for (int source = 0; source < kPpuOverlaySource_Count; source++)
+    if (g_ppu->overlayRenderBuffer[source])
+      return false;
+  int count = Dkc1HdParallelWidth();
+  if (count > kBandMaxThreads)
+    count = kBandMaxThreads;
+  if (count < 2)
+    return false;
+  if (!s_band_base) {
+    s_band_base = malloc(sizeof *s_band_base);
+    for (int i = 1; i < count; i++)
+      s_band_ppu[i] = malloc(sizeof *s_band_ppu[i]);
+  }
+  if (!s_band_base)
+    return false;
+  for (int i = 1; i < count; i++)
+    if (!s_band_ppu[i])
+      return false;
+
+  /* Line 0 only sets up the frame; then the whole frame's HDMA writes. */
+  RunBiasedLine(g_ppu, 0, bias);
+  for (int line = 0; line < kBandLines; line++) {
+    BandLineWrites *w = &s_band_writes[line];
+    w->count = 0;
+    for (int channel = 0; channel < 8; channel++) {
+      if (!active[channel])
+        continue;
+      const int n = SimpleHdma_DoLineWrites(
+          &channels[channel], w->regs + w->count, w->values + w->count,
+          kBandMaxWrites - w->count);
+      for (int i = 0; i < n; i++)
+        debug_server_on_reg_write(
+            (uint16_t)(0x2100u + w->regs[w->count + i]),
+            w->values[w->count + i]);
+      w->count = (uint8_t)(w->count + n);
+    }
+  }
+  memcpy(s_band_base, g_ppu, sizeof *s_band_base);
+  const uint16_t gen0 = g_ppu->identGen;
+  s_band.bias = bias;
+  s_band.forget = forget;
+  for (int i = 0; i <= count; i++)
+    s_band.first[i] = 1 + (kBandLines - 1) * i / count;
+  Dkc1HdParallelRun(DrawBand, NULL);
+
+  /* g_ppu drew band 0: give it the remaining writes and the merged state. */
+  for (int line = s_band.first[1]; line < kBandLines; line++)
+    ApplyLineWrites(g_ppu, line);
+  bool range_over = false, time_over = false;
+  for (int i = 0; i < count; i++) {
+    range_over = range_over || s_band.range_over[i];
+    time_over = time_over || s_band.time_over[i];
+  }
+  g_ppu->rangeOver = range_over;
+  g_ppu->timeOver = time_over;
+  g_ppu->lineHasSprites = s_band_ppu[count - 1]->lineHasSprites;
+  if (g_ppu->identPixels)
+    g_ppu->identGen = AdvanceIdentGen(gen0, kBandLines - 1);
+  return true;
 }
 
 void Dkc1DrawPpuFrame(void) {
@@ -2280,9 +2475,12 @@ void Dkc1DrawPpuFrame(void) {
    * (right half) to the right, instead of leaving them inside the
    * centered 256 columns. Presentation only: the OAM itself is unchanged. */
   {
-    const int hud = extend_world ? Dkc1HudOamPrefix(g_ppu) : 0;
+    uint8_t mask[16];
+    const int hud = extend_world ? Dkc1HudOamMask(g_ppu, mask) : 0;
     PpuSetWsHudOamBand(g_ppu, hud ? 48 : 0, 128, 129);
-    PpuSetWsHudOamShiftRange(g_ppu, 0, (uint8_t)hud);
+    PpuSetWsHudOamShiftRange(g_ppu, 0, 0);
+    PpuSetWsHudOamShiftRange2(g_ppu, 0, 0);
+    PpuSetWsHudOamMask(g_ppu, hud ? mask : NULL);
   }
   Dkc1HdPrepareFrame(g_ppu);
   Dkc1BabyKongPrepareFrame(g_ppu, g_ram, presentation_bias);
@@ -2295,20 +2493,20 @@ void Dkc1DrawPpuFrame(void) {
       SimpleHdma_Init(&channels[channel], &g_dma->channel[channel]);
   }
 
-  for (int line = 0; line <= 224; line++) {
-    if (extend_world && presentation_bias != 0) {
-      for (int layer = 0; layer < 4; layer++)
-        g_ppu->hScroll[layer] =
-            (uint16_t)(g_ppu->hScroll[layer] + presentation_bias);
-    }
-    ppu_runLine(g_ppu, line);
-    if (extend_world && presentation_bias != 0) {
-      for (int layer = 0; layer < 4; layer++)
-        g_ppu->hScroll[layer] =
-            (uint16_t)(g_ppu->hScroll[layer] - presentation_bias);
-    }
-    for (int channel = 0; channel < 8; channel++) {
-      if (active[channel]) SimpleHdma_DoLine(&channels[channel]);
+  const int line_bias = extend_world ? presentation_bias : 0;
+  /* A frame whose identity generations wrap starts from cleared stamps, so
+   * an entry from 65535 lines ago never passes for this line's. */
+  const bool forget_identity =
+      g_ppu->identPixels &&
+      (uint32_t)g_ppu->identGen + (kBandLines - 1) > 0xffffu;
+  if (forget_identity)
+    PpuIdentityForget(g_ppu);
+  if (!DrawLinesInBands(channels, active, line_bias, forget_identity)) {
+    for (int line = 0; line <= 224; line++) {
+      RunBiasedLine(g_ppu, line, line_bias);
+      for (int channel = 0; channel < 8; channel++) {
+        if (active[channel]) SimpleHdma_DoLine(&channels[channel]);
+      }
     }
   }
 

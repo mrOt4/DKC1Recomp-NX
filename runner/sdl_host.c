@@ -1431,6 +1431,9 @@ static bool PrepareHdPresentation(void) {
 #ifdef __SWITCH__
 /* GL presenter: the picture keeps its presentation aspect inside the
  * current drawable (1080p docked, 720p handheld). */
+static void SwitchBenchProfileGpu(const Dkc1HdGpuInputs *gpu, int width,
+                                  int height);
+
 static void SwitchGlPresent(void) {
   int ow = 0, oh = 0;
   SDL_GL_GetDrawableSize(s_window, &ow, &oh);
@@ -1443,13 +1446,13 @@ static void SwitchGlPresent(void) {
     vw = (int)((int64_t)oh * pw / kDkc1VideoHeight);
   }
   const int vx = (ow - vw) / 2, vy = (oh - vh) / 2;
-  /* The swap chain keeps whatever the bars around the picture last held
-   * (16:9 frames after switching to 4:3): clear the whole surface. */
-  Dkc1HdGpuClearScreen(0, ow, oh);
   const Dkc1HdGpuInputs *gpu = Dkc1HdGpuFrame();
   int hd_width, hd_height;
   const uint32_t *hd;
   const double t0 = FramePacerNow();
+  /* Compose into its own target first: the first draw into the window's
+   * framebuffer waits for the display to release a buffer, and the GPU runs
+   * in order, so composing after that would wait too. */
   const bool composed = gpu && Dkc1HdGpuCompose(gpu);
   const double t1 = FramePacerNow();
   if (composed && s_hd_perf.gpu_finish) {
@@ -1457,6 +1460,9 @@ static void SwitchGlPresent(void) {
     s_hd_perf.gpu += FramePacerNow() - t1;
   }
   s_hd_perf.submit += t1 - t0;
+  /* The swap chain keeps whatever the bars around the picture last held
+   * (16:9 frames after switching to 4:3): clear the whole surface. */
+  Dkc1HdGpuClearScreen(0, ow, oh);
   if (composed)
     Dkc1HdGpuPresent(0, vx, vy, vw, vh);
   else if ((hd = Dkc1HdOutput(&hd_width, &hd_height, NULL)) != NULL)
@@ -1469,6 +1475,7 @@ static void SwitchGlPresent(void) {
   if (s_overlay_live)
     Dkc1HdGpuPresentOverlay(s_overlay, s_width, kDkc1VideoHeight,
                             (size_t)s_width, 0, vx, vy, vw, vh);
+  SwitchBenchProfileGpu(composed ? gpu : NULL, ow, oh);
 }
 #endif
 
@@ -2332,6 +2339,22 @@ unsigned Dkc1MacPauseMenuController(void) {
 #ifdef __SWITCH__
 /* Settings take effect immediately except MSU-1, whose pack (and the SPC
  * music mute) is chosen at boot. */
+/* Menu language from the console's: Spanish (Spain or Latin America) or
+ * English for every other language. */
+static int SwitchSystemLanguage(void) {
+  int language = kDkc1MenuLanguageEnglish;
+  u64 code = 0;
+  SetLanguage set_language;
+  if (R_SUCCEEDED(setInitialize())) {
+    if (R_SUCCEEDED(setGetSystemLanguage(&code)) &&
+        R_SUCCEEDED(setMakeLanguage(code, &set_language)) &&
+        (set_language == SetLanguage_ES || set_language == SetLanguage_ES419))
+      language = kDkc1MenuLanguageSpanish;
+    setExit();
+  }
+  return language;
+}
+
 static void SwitchMenuApply(void) {
   /* The CPU always runs at 1785 MHz (restored on exit); not a setting. */
   static bool s_boosted;
@@ -2366,9 +2389,18 @@ static void SwitchMenuApply(void) {
   }
 }
 
+static const char *SwitchBenchLabel(void);
+
 static void SwitchOverlayRefresh(void) {
   memset(s_overlay, 0, sizeof s_overlay);
   s_overlay_live = false;
+  /* Bench mode names the running case, so a screenshot identifies it. */
+  const char *bench = SwitchBenchLabel();
+  if (bench) {
+    Dkc1MenuDrawText(s_overlay, s_width, kDkc1VideoHeight, (size_t)s_width,
+                     4, kDkc1VideoHeight - 12, bench, 0xffff60);
+    s_overlay_live = true;
+  }
   if (s_menu.perf && s_perf.text[0]) {
     Dkc1MenuDrawText(s_overlay, s_width, kDkc1VideoHeight, (size_t)s_width,
                      4, 4, s_perf.text, s_perf.warn ? 0xff8060 : 0x80ff80);
@@ -2377,7 +2409,8 @@ static void SwitchOverlayRefresh(void) {
   if (Dkc1MenuIsOpen()) {
     Dkc1MenuDraw(&s_menu, s_overlay, s_width, kDkc1VideoHeight,
                  (size_t)s_width, s_cheat_count && s_menu.cheat_codes
-                     ? "cheats.txt cargado" : NULL,
+                     ? Dkc1MenuText(&s_menu, kDkc1MenuStringCheatsLoaded)
+                     : NULL,
                  s_menu_message);
     s_overlay_live = true;
   }
@@ -2431,15 +2464,18 @@ static void SwitchMenuFrame(void) {
       break;
     case kDkc1MenuActionSave:
       QuickSave();
-      snprintf(s_menu_message, sizeof s_menu_message, "%s ranura %d",
-               strstr(s_status, "FAILED") ? "Error al guardar" : "Guardado en",
+      snprintf(s_menu_message, sizeof s_menu_message,
+               Dkc1MenuText(&s_menu, strstr(s_status, "FAILED")
+                                         ? kDkc1MenuStringSaveFailed
+                                         : kDkc1MenuStringSavedSlot),
                s_menu.slot + 1);
       break;
     case kDkc1MenuActionLoad:
       QuickLoad();
       if (strstr(s_status, "FAILED")) {
         snprintf(s_menu_message, sizeof s_menu_message,
-                 "Ranura %d vacia", s_menu.slot + 1);
+                 Dkc1MenuText(&s_menu, kDkc1MenuStringSlotEmpty),
+                 s_menu.slot + 1);
       } else {
         SwitchMenuClose();
         return;
@@ -2544,9 +2580,9 @@ static void SwitchPerfRecord(const Dkc1FrameWorkProfile *profile,
   const unsigned gaps = (unsigned)(underruns - s_last_underruns);
   s_last_underruns = underruns;
   snprintf(s_perf.text, sizeof s_perf.text,
-           "%.1fms cpu%.1f ppu%.1f max%.0f lento%d aud%u", s_perf.work / n,
+           "%.1fms cpu%.1f ppu%.1f max%.0f %s%d aud%u", s_perf.work / n,
            s_perf.emulation / n, s_perf.render / n, s_perf.worst,
-           s_perf.slow, gaps);
+           Dkc1MenuText(&s_menu, kDkc1MenuStringSlow), s_perf.slow, gaps);
   fprintf(stderr, "[perf] %s audio%.1f\n", s_perf.text, s_perf.audio / n);
   {
     static uint64_t s_last_encode_ns;
@@ -2571,6 +2607,252 @@ static void SwitchPerfRecord(const Dkc1FrameWorkProfile *profile,
   s_perf.worst = 0;
   s_perf.frames = s_perf.slow = 0;
   SwitchOverlayRefresh();
+}
+/* Bench mode, for measuring on the console: with bench.flag in the app
+ * folder, every name in bench/cases.txt is replayed from bench/<name>.state
+ * with the joypad masks of bench/<name>.inp, and per-case frame times go to
+ * bench.log; the app quits when done and deletes bench.flag, so the next
+ * launch plays normally. bench.flag may hold "frames=N"
+ * (default 600), "modes=hd,vsync,gpu,native" (any of: HD on; HD on with
+ * vblank-paced swaps; HD on with the GPU
+ * timed through glFinish, which serializes it with the CPU; HD off, in
+ * that order) and "gpu=1" (time the GPU in every HD pass). */
+enum { kBenchMaxCases = 64, kBenchWarmup = 30, kBenchSlowLines = 12 };
+static struct {
+  bool on, gpu;
+  int cases, index, mode, modes;  /* mode 0 HD, 1 native, 2 HD + GPU time,
+                                     3 HD with vblank-paced swaps;
+                                     modes: bit per mode */
+  double interval_sum;
+  char names[kBenchMaxCases][24];
+  long frame, frames;
+  FILE *log;
+  double last_present;
+  double work, emulation, draw, submit, gpu_ms, swap, worst, worst_interval;
+  double warm_worst;
+  int counted, slow, missed, slow_lines;
+  uint32_t underruns;
+  uint64_t compose_ns;
+} s_bench;
+
+/* FNV-1a of WRAM: compared with a desktop replay of the same case to prove
+ * the console runs the same game (tools: the same state and input). */
+static uint64_t BenchWramHash(void) {
+  uint64_t h = 0xcbf29ce484222325ull;
+  for (size_t i = 0; i < sizeof g_ram; i++)
+    h = (h ^ g_ram[i]) * 0x100000001b3ull;
+  return h;
+}
+
+static const char *SwitchBenchLabel(void) {
+  static char label[32];
+  if (!s_bench.on)
+    return NULL;
+  snprintf(label, sizeof label, "caso %s", s_bench.names[s_bench.index]);
+  return label;
+}
+
+static void SwitchBenchStartCase(void) {
+  const char *name = s_bench.names[s_bench.index];
+  char path[64], error[160];
+  snprintf(path, sizeof path, "bench/%s.state", name);
+  if (!RtlLoadSnapshot(path))
+    fprintf(s_bench.log, "%s: state load failed\n", name);
+  ClearRewind();
+  ReconcileHostTimeline();
+  /* After ReconcileHostTimeline, which drops any input playback. */
+  snprintf(path, sizeof path, "bench/%s.inp", name);
+  if (!Dkc1InputPlaybackLoad(path, &s_input_playback, error, sizeof error))
+    fprintf(s_bench.log, "%s: input %s\n", name, error);
+  Dkc1HdSetEnabled(s_bench.mode != 1 && Dkc1HdReady() && s_menu.widescreen);
+  /* Pass 3 lets the vblank pace the loop; the others the host clock. */
+  s_switch_vsync = s_bench.mode == 3;
+  SDL_GL_SetSwapInterval(s_switch_vsync ? 1 : 0);
+  s_bench.interval_sum = 0.0;
+  s_hd_perf.gpu_finish = s_bench.gpu || s_bench.mode == 2;
+  s_bench.frame = 0;
+  s_bench.last_present = 0.0;
+  s_bench.work = s_bench.emulation = s_bench.draw = s_bench.submit = 0.0;
+  s_bench.gpu_ms = s_bench.swap = s_bench.worst = s_bench.worst_interval = 0.0;
+  s_bench.warm_worst = 0.0;
+  s_bench.counted = s_bench.slow = s_bench.missed = s_bench.slow_lines = 0;
+  s_bench.underruns = Dkc1SwitchAudioUnderruns();
+  s_reanchor_pacer = 1;
+  SwitchOverlayRefresh();
+}
+
+/* Once per HD case, on the last warm-up frame (outside the statistics):
+ * the GPU time of each stage, see Dkc1HdGpuProfile. */
+static void SwitchBenchProfileGpu(const Dkc1HdGpuInputs *gpu, int width,
+                                  int height) {
+  if (!s_bench.on || !gpu || s_bench.mode != 0 ||
+      s_bench.frame != kBenchWarmup - 1)
+    return;
+  char text[256];
+  if (Dkc1HdGpuProfile(gpu, width, height, text, sizeof text) > 0)
+    fprintf(s_bench.log, "   gpuprof %s:%s\n",
+            s_bench.names[s_bench.index], text);
+}
+
+static void SwitchBenchInit(void) {
+  FILE *flag = fopen("bench.flag", "r");
+  if (!flag)
+    return;
+  s_bench.frames = 600;
+  s_bench.modes = 1;
+  char line[160];
+  while (fgets(line, sizeof line, flag)) {
+    if (!strncmp(line, "frames=", 7) && atol(line + 7) > kBenchWarmup)
+      s_bench.frames = atol(line + 7);
+    if (!strncmp(line, "modes=", 6)) {
+      s_bench.modes = (strstr(line, "hd") ? 1 : 0) |
+                      (strstr(line, "native") ? 2 : 0) |
+                      (strstr(line, "gpu") ? 4 : 0) |
+                      (strstr(line, "vsync") ? 8 : 0);
+    }
+    if (!strncmp(line, "gpu=1", 5))
+      s_bench.gpu = true;
+  }
+  fclose(flag);
+  FILE *list = fopen("bench/cases.txt", "r");
+  while (list && s_bench.cases < kBenchMaxCases &&
+         fgets(line, sizeof line, list)) {
+    char *end = line + strcspn(line, " \t\r\n#");
+    *end = 0;
+    if (line[0])
+      snprintf(s_bench.names[s_bench.cases++], sizeof s_bench.names[0], "%.23s",
+               line);
+  }
+  if (list)
+    fclose(list);
+  if (!s_bench.cases || !s_bench.modes)
+    return;
+  s_bench.log = fopen("bench.log", "w");
+  if (!s_bench.log)
+    return;
+  fprintf(s_bench.log,
+          "# DKC1Recomp-NX bench: %d cases x %ld frames, %s, %s, GPU %u MHz, "
+          "msu1=%d "
+          "hd_ready=%d "
+          "gpu_finish=%d\n# avg/emu/draw/enc/submit/gpu/swap: mean ms per frame "
+          "after %d warm-up frames; max: worst work; late: present intervals "
+          "> 18 ms; slow: work > 16.7 ms\n",
+          s_bench.cases, s_bench.frames,
+          appletGetOperationMode() == AppletOperationMode_Console ? "docked"
+                                                                   : "handheld",
+          appletGetAppletType() == AppletType_Application ||
+                  appletGetAppletType() == AppletType_SystemApplication
+              ? "title takeover"
+              : "applet mode",
+          (unsigned)Dkc1SwitchGpuClockMHz(), s_menu.msu1, Dkc1HdReady(), s_bench.gpu, kBenchWarmup);
+  s_bench.on = true;
+  s_bench.mode = (s_bench.modes & 1)   ? 0
+                 : (s_bench.modes & 8) ? 3
+                 : (s_bench.modes & 4) ? 2
+                                       : 1;
+  SwitchBenchStartCase();
+}
+
+static void SwitchBenchRecord(const Dkc1FrameWorkProfile *profile,
+                              double work, double swap, double presented_at,
+                              double frequency) {
+  if (!s_bench.on)
+    return;
+  const double ms = 1000.0 / frequency;
+  const double interval =
+      s_bench.last_present > 0.0 ? (presented_at - s_bench.last_present) * ms
+                                 : 0.0;
+  s_bench.last_present = presented_at;
+  const double draw = s_hd_perf.draw * ms, submit = s_hd_perf.submit * ms,
+               gpu = s_hd_perf.gpu * ms;
+  s_hd_perf.draw = s_hd_perf.submit = s_hd_perf.gpu = 0.0;
+  const long f = s_bench.frame++;
+  if (f == kBenchWarmup) {
+    Dkc1HdStats hd;
+    Dkc1HdGetStats(&hd);
+    s_bench.compose_ns = hd.compose_ns;
+  }
+  if (f < kBenchWarmup) {
+    if (work * ms > s_bench.warm_worst)
+      s_bench.warm_worst = work * ms;
+  } else {
+    s_bench.counted++;
+    s_bench.work += work * ms;
+    s_bench.emulation += profile->emulation * ms;
+    s_bench.draw += draw;
+    s_bench.submit += submit;
+    s_bench.gpu_ms += gpu;
+    s_bench.swap += swap * ms;
+    if (work * ms > s_bench.worst)
+      s_bench.worst = work * ms;
+    if (interval > s_bench.worst_interval)
+      s_bench.worst_interval = interval;
+    s_bench.interval_sum += interval;
+    const bool slow = work * ms > 16.7, late = interval > 18.0;
+    s_bench.slow += slow;
+    s_bench.missed += late;
+    if ((slow || late) && s_bench.slow_lines < kBenchSlowLines) {
+      s_bench.slow_lines++;
+      fprintf(s_bench.log,
+              "   f%ld work%.1f emu%.1f draw%.1f submit%.1f swap%.1f "
+              "interval%.1f\n",
+              f, work * ms, profile->emulation * ms, draw, submit, swap * ms,
+              interval);
+    }
+  }
+  if (s_bench.frame < s_bench.frames)
+    return;
+  Dkc1HdStats hd;
+  Dkc1HdGetStats(&hd);
+  const double n = s_bench.counted > 0 ? s_bench.counted : 1;
+  fprintf(s_bench.log,
+          "%-6s %-6s avg%5.2f emu%5.2f draw%5.2f enc%5.2f submit%5.2f "
+          "gpu%5.2f swap%5.2f max%5.1f warm%5.1f late%3d slow%3d "
+          "maxint%5.1f fps%6.2f aud%u wram%016llx\n",
+          s_bench.names[s_bench.index],
+          s_bench.mode == 0   ? "hd"
+          : s_bench.mode == 2 ? "hd+gpu"
+          : s_bench.mode == 3 ? "vsync"
+                              : "native",
+          s_bench.work / n, s_bench.emulation / n, s_bench.draw / n,
+          (hd.compose_ns - s_bench.compose_ns) / 1e6 / n, s_bench.submit / n,
+          s_bench.gpu_ms / n, s_bench.swap / n, s_bench.worst,
+          s_bench.warm_worst, s_bench.missed, s_bench.slow,
+          s_bench.worst_interval,
+          s_bench.interval_sum > 0.0 ? 1000.0 * n / s_bench.interval_sum : 0.0,
+          (unsigned)(Dkc1SwitchAudioUnderruns() - s_bench.underruns),
+          (unsigned long long)BenchWramHash());
+  fflush(s_bench.log);
+  if (++s_bench.index >= s_bench.cases) {
+    s_bench.index = 0;
+    /* Passes in order: HD, vsync, HD + GPU time, native. */
+    static const int kOrder[] = {0, 3, 2, 1};
+    static const int kBit[] = {1, 8, 4, 2};
+    int at = 0;
+    while (kOrder[at] != s_bench.mode)
+      at++;
+    int next = -1;
+    for (int k = at + 1; k < 4 && next < 0; k++)
+      if (s_bench.modes & kBit[k])
+        next = kOrder[k];
+    if (next >= 0) {
+      s_bench.mode = next;
+    } else {
+      fprintf(s_bench.log, "# done\n");
+      s_switch_vsync = false;
+      SDL_GL_SetSwapInterval(0);
+      fclose(s_bench.log);
+      /* One run per flag: the next launch plays normally. */
+      remove("bench.flag");
+      s_bench.log = NULL;
+      s_bench.on = false;
+      SwitchOverlayRefresh();
+      Dkc1InputPlaybackFree(&s_input_playback);
+      s_running = 0;
+      return;
+    }
+  }
+  SwitchBenchStartCase();
 }
 #endif
 
@@ -3013,6 +3295,8 @@ int main(int argc, char **argv) {
 #ifdef __SWITCH__
   Dkc1SwitchPinMainThread();
   Dkc1MenuLoadSettings(&s_menu, kSwitchMenuConfig);
+  if (s_menu.language == kDkc1MenuLanguageAuto)
+    s_menu.language = SwitchSystemLanguage();
   s_cheat_count = Dkc1MenuLoadCheats(kSwitchCheatFile, s_cheats,
                                      kDkc1MenuMaxCheats);
 #endif
@@ -3244,6 +3528,9 @@ int main(int argc, char **argv) {
   DisplayPacerInit(&display_pacer);
   PacingLogInit(&pacing_log);
 
+#ifdef __SWITCH__
+  SwitchBenchInit();
+#endif
   while (s_running) {
 #ifdef __SWITCH__
     /* Home-button / suspend pump; libnx kills titles that starve
@@ -3376,8 +3663,13 @@ int main(int argc, char **argv) {
     }
     for (int subframe = 0; subframe < (s_fast_forward ? 3 : 1); subframe++) {
     CaptureRewind();
+    size_t playback_frame = (size_t)s_host_frame;
+#ifdef __SWITCH__
+    if (s_bench.on)
+      playback_frame = (size_t)s_bench.frame;
+#endif
     uint32_t input = s_input_playback.count
-        ? Dkc1InputPlaybackFrame(&s_input_playback, (size_t)s_host_frame)
+        ? Dkc1InputPlaybackFrame(&s_input_playback, playback_frame)
         : live_input;
     Dkc1DebugRecordInput(input);
     phase_end = FramePacerNow();
@@ -3519,6 +3811,9 @@ int main(int argc, char **argv) {
     SubmitPresentation();
     const double presented_at = FramePacerNow();
 #ifdef __SWITCH__
+    SwitchBenchRecord(&work_profile, work_end - work_start,
+                      presented_at - present_start, presented_at,
+                      pacer.frequency);
     SwitchTrackFrameRate(presented_at, presented_at - present_start,
                          pacer.frequency,
                          single_step || s_paused || s_fast_forward ||

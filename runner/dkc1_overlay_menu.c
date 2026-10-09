@@ -12,6 +12,7 @@
 
 enum {
   kItemResume,
+  kItemLanguage,
   kItemSlot,
   kItemSave,
   kItemLoad,
@@ -29,8 +30,64 @@ enum {
 static bool s_open;
 static int s_cursor;
 
+/* Menu text per language; the font is ASCII only (no accents or n-tilde).
+ * Labels must leave room for the right-aligned value: 30 columns in all. */
+static const char *const kLabels[kDkc1MenuLanguageCount][kItemCount] = {
+  {
+    "Resume",
+    "Language/Idioma",
+    "Slot",
+    "Save state",
+    "Load state",
+    "Rewind L / Fast fwd R",
+    "MSU-1 music (restart)",
+    "Screen",
+    "HD textures",
+    "Cheat: infinite lives",
+    "Codes (cheats.txt)",
+    "Performance overlay",
+    "Quit game",
+  },
+  {
+    "Continuar",
+    "Idioma/Language",
+    "Ranura",
+    "Guardar estado",
+    "Cargar estado",
+    "Rebobinar L / Avanzar R",
+    "Musica MSU-1 (reiniciar)",
+    "Pantalla",
+    "Texturas HD",
+    "Truco: vidas infinitas",
+    "Codigos (cheats.txt)",
+    "Rendimiento en pantalla",
+    "Salir del juego",
+  },
+};
+
+static const char *const kStrings[kDkc1MenuLanguageCount]
+                                 [kDkc1MenuStringCount] = {
+  {"cheats.txt loaded", "Saved to slot %d", "Save failed, slot %d",
+   "Slot %d is empty", "slow"},
+  {"cheats.txt cargado", "Guardado en ranura %d", "Error al guardar ranura %d",
+   "Ranura %d vacia", "lento"},
+};
+
+static int Language(const Dkc1MenuSettings *settings) {
+  return settings->language == kDkc1MenuLanguageSpanish
+             ? kDkc1MenuLanguageSpanish
+             : kDkc1MenuLanguageEnglish;
+}
+
+const char *Dkc1MenuText(const Dkc1MenuSettings *settings, Dkc1MenuString id) {
+  if (id < 0 || id >= kDkc1MenuStringCount)
+    return "";
+  return kStrings[Language(settings)][id];
+}
+
 void Dkc1MenuDefaults(Dkc1MenuSettings *settings) {
   memset(settings, 0, sizeof *settings);
+  settings->language = kDkc1MenuLanguageAuto;
   settings->msu1 = true;
   settings->widescreen = true;
   settings->hd = true;
@@ -77,6 +134,9 @@ void Dkc1MenuLoadSettings(Dkc1MenuSettings *settings, const char *path) {
     const int value = atoi(eq + 1);
     if (!strcmp(line, "slot") && value >= 0 && value < 5)
       settings->slot = value;
+    if (!strcmp(line, "language") && value >= 0 &&
+        value < kDkc1MenuLanguageCount)
+      settings->language = value;
     for (size_t i = 0; i < sizeof kKeys / sizeof kKeys[0]; i++)
       if (!strcmp(line, kKeys[i].key))
         *(bool *)((char *)settings + kKeys[i].offset) = value != 0;
@@ -89,6 +149,8 @@ bool Dkc1MenuSaveSettings(const Dkc1MenuSettings *settings, const char *path) {
   if (!file)
     return false;
   fprintf(file, "slot=%d\n", settings->slot);
+  if (settings->language >= 0)
+    fprintf(file, "language=%d\n", settings->language);
   for (size_t i = 0; i < sizeof kKeys / sizeof kKeys[0]; i++)
     fprintf(file, "%s=%d\n", kKeys[i].key,
             *(const bool *)((const char *)settings + kKeys[i].offset) ? 1 : 0);
@@ -123,6 +185,13 @@ Dkc1MenuAction Dkc1MenuUpdate(Dkc1MenuSettings *settings, uint32_t pressed) {
                    : (pressed & kDkc1GamepadDpadLeft) ? -1 : 0;
   if (s_cursor == kItemSlot && step) {
     settings->slot = (settings->slot + 5 + step) % 5;
+    return kDkc1MenuActionChanged;
+  }
+  if (s_cursor == kItemLanguage && (step || (pressed & kDkc1GamepadA))) {
+    const int current = settings->language < 0 ? 0 : settings->language;
+    settings->language =
+        (current + kDkc1MenuLanguageCount + (step ? step : 1)) %
+        kDkc1MenuLanguageCount;
     return kDkc1MenuActionChanged;
   }
   bool *toggle = Toggle(settings, s_cursor);
@@ -207,20 +276,8 @@ void Dkc1MenuDraw(const Dkc1MenuSettings *settings, uint32_t *pixels,
                   const char *message) {
   if (!s_open)
     return;
-  static const char *const kLabels[kItemCount] = {
-    "Continuar",
-    "Ranura",
-    "Guardar estado",
-    "Cargar estado",
-    "Rebobinar L / Avanzar R",
-    "Musica MSU-1 (reiniciar)",
-    "Pantalla",
-    "Texturas HD",
-    "Truco: vidas infinitas",
-    "Codigos (cheats.txt)",
-    "Rendimiento en pantalla",
-    "Salir del juego",
-  };
+  const int lang = Language(settings);
+  const char *const *labels = kLabels[lang];
   const int panel_w = 240, line_h = 12;
   const int panel_h = 34 + kItemCount * line_h + 22;
   const int x0 = (width - panel_w) / 2, y0 = (height - panel_h) / 2;
@@ -228,24 +285,31 @@ void Dkc1MenuDraw(const Dkc1MenuSettings *settings, uint32_t *pixels,
   Dkc1MenuDrawText(pixels, width, height, pitch, x0 + 8, y0 + 6,
                    "DKC1Recomp-NX", 0xffd040);
   Dkc1MenuDrawText(pixels, width, height, pitch, x0 + 8, y0 + 18,
-                   "B / R3 / + y -: cerrar", 0x909090);
+                   lang == kDkc1MenuLanguageSpanish ? "B / R3 / + y -: cerrar"
+                                                    : "B / R3 / + and -: close",
+                   0x909090);
   for (int i = 0; i < kItemCount; i++) {
     const int y = y0 + 34 + i * line_h;
     const uint32_t color = i == s_cursor ? 0xffffff : 0xa0a0a0;
     if (i == s_cursor)
       Dkc1MenuDrawText(pixels, width, height, pitch, x0 + 4, y, ">", 0xffd040);
-    Dkc1MenuDrawText(pixels, width, height, pitch, x0 + 14, y, kLabels[i],
+    Dkc1MenuDrawText(pixels, width, height, pitch, x0 + 14, y, labels[i],
                      color);
     char value[16] = "";
     const bool *toggle = Toggle((Dkc1MenuSettings *)settings, i);
-    if (i == kItemAspect)
+    if (i == kItemLanguage)
+      snprintf(value, sizeof value, "< %s >",
+               lang == kDkc1MenuLanguageSpanish ? "Espanol" : "English");
+    else if (i == kItemAspect)
       snprintf(value, sizeof value, "< %s >",
                settings->widescreen ? "16:9" : "4:3");
     else if (i == kItemHd &&
              (!settings->widescreen || !settings->hd_available))
       snprintf(value, sizeof value, "--");
     else if (toggle)
-      snprintf(value, sizeof value, "%s", *toggle ? "SI" : "NO");
+      snprintf(value, sizeof value, "%s",
+               *toggle ? (lang == kDkc1MenuLanguageSpanish ? "SI" : "ON")
+                       : (lang == kDkc1MenuLanguageSpanish ? "NO" : "OFF"));
     else if (i == kItemSlot)
       snprintf(value, sizeof value, "< %d >", settings->slot + 1);
     if (value[0])

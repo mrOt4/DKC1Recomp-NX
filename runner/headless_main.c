@@ -514,7 +514,34 @@ int main(int argc, char **argv) {
       free(rom);
       return 5;
     }
-    Dkc1DrawPpuFrame();
+    {
+      /* DKC1_DRAW_TIMES=<path>: per frame, the wall time of the PPU draw
+       * and of its HD part (Dkc1HdStats.compose_ns), in microseconds. */
+      static FILE *draw_times;
+      static int draw_times_init;
+      if (!draw_times_init) {
+        draw_times_init = 1;
+        const char *path = getenv("DKC1_DRAW_TIMES");
+        if (path && *path)
+          draw_times = fopen(path, "w");
+      }
+      struct timespec t0, t1;
+      Dkc1HdStats before;
+      if (draw_times) {
+        Dkc1HdGetStats(&before);
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+      }
+      Dkc1DrawPpuFrame();
+      if (draw_times) {
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        Dkc1HdStats after;
+        Dkc1HdGetStats(&after);
+        fprintf(draw_times, "%ld %.1f %.1f\n", frame,
+                (t1.tv_sec - t0.tv_sec) * 1e6 +
+                    (t1.tv_nsec - t0.tv_nsec) / 1e3,
+                (after.compose_ns - before.compose_ns) / 1e3);
+      }
+    }
     HashGpuInputs();
     Dkc1BlankScanFrame(frame + 1, pixels, Dkc1VideoWidth(),
                        kDkc1VideoHeight, Dkc1VideoTerrainReady());
@@ -551,6 +578,13 @@ int main(int argc, char **argv) {
         Dkc1InputPlaybackFree(&input_playback);
         free(rom);
         return 18;
+      }
+      /* DKC1_HD_PPM_SEQUENCE=1: the HD frame too, as <prefix>_hd_N.ppm. */
+      const char *hd_sequence = getenv("DKC1_HD_PPM_SEQUENCE");
+      if (hd_sequence && *hd_sequence == '1') {
+        snprintf(path, sizeof path, "%s_hd_%06ld.ppm", frame_sequence_prefix,
+                 frame);
+        (void)Dkc1HdWritePpm(path);
       }
     }
 

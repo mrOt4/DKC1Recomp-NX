@@ -1560,6 +1560,10 @@ typedef struct HdBand {
   int width, y0, y1;
   bool gpu;  /* encode GPU inputs instead of composing on the CPU */
   Dkc1HdStats stats;
+  /* Dkc1HdParallelRun: a host task instead of composition. */
+  void (*task)(void *context, int index, int count);
+  void *context;
+  int index, count;
 } HdBand;
 
 #if HD_WIN32_THREADS
@@ -1593,6 +1597,10 @@ static void EncodeGpuRows(Ppu *ppu, int width, int y0, int y1,
                           Dkc1HdStats *stats);
 
 static void RunBand(HdBand *band) {
+  if (band->task) {
+    band->task(band->context, band->index, band->count);
+    return;
+  }
   memset(&band->stats, 0, sizeof band->stats);
   if (band->gpu)
     EncodeGpuRows(band->ppu, band->width, band->y0, band->y1, &band->stats);
@@ -1707,6 +1715,7 @@ static void RunBands(Ppu *ppu, int width, bool gpu) {
   }
   const int bands = s_workers + 1;
   for (int i = 0; i < bands; i++) {
+    s_bands[i].task = NULL;
     s_bands[i].ppu = ppu;
     s_bands[i].width = width;
     s_bands[i].gpu = gpu;
@@ -1725,6 +1734,39 @@ static void RunBands(Ppu *ppu, int width, bool gpu) {
   POOL_UNLOCK();
   for (int i = 0; i < bands; i++)
     AddStats(&s_stats, &s_bands[i].stats);
+}
+
+int Dkc1HdParallelWidth(void) {
+  if (s_workers < 0)
+    StartWorkers();
+  return s_workers + 1;
+}
+
+void Dkc1HdParallelRun(void (*task)(void *context, int index, int count),
+                       void *context) {
+  const int count = Dkc1HdParallelWidth();
+  for (int i = 0; i < count; i++) {
+    s_bands[i].task = task;
+    s_bands[i].context = context;
+    s_bands[i].index = i;
+    s_bands[i].count = count;
+  }
+  if (count > 1) {
+    POOL_LOCK();
+    s_pool_pending = s_workers;
+    s_pool_generation++;
+    POOL_BROADCAST(s_pool_wake);
+    POOL_UNLOCK();
+  }
+  RunBand(&s_bands[0]);
+  if (count > 1) {
+    POOL_LOCK();
+    while (s_pool_pending)
+      POOL_WAIT(s_pool_done);
+    POOL_UNLOCK();
+  }
+  for (int i = 0; i < count; i++)
+    s_bands[i].task = NULL;
 }
 
 static void ComposeFrame(Ppu *ppu, int width) {

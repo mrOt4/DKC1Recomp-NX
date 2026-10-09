@@ -35,6 +35,10 @@ typedef unsigned char GLboolean;
 typedef float GLfloat;
 typedef char GLchar;
 typedef unsigned int GLbitfield;
+typedef ptrdiff_t GLsizeiptr;
+typedef ptrdiff_t GLintptr;
+typedef unsigned long long GLuint64;
+typedef struct __GLsync *GLsync;
 
 enum {
   HD_GL_TEXTURE_2D = 0x0DE1,
@@ -78,6 +82,14 @@ enum {
   HD_GL_SCISSOR_TEST = 0x0C11,
   HD_GL_FRAMEBUFFER_BINDING = 0x8CA6,
   HD_GL_NO_ERROR = 0,
+  HD_GL_PIXEL_UNPACK_BUFFER = 0x88EC,
+  HD_GL_STREAM_DRAW = 0x88E0,
+  HD_GL_MAP_WRITE_BIT = 0x0002,
+  HD_GL_MAP_INVALIDATE_BUFFER_BIT = 0x0008,
+  HD_GL_MAP_UNSYNCHRONIZED_BIT = 0x0020,
+  HD_GL_SYNC_GPU_COMMANDS_COMPLETE = 0x9117,
+  HD_GL_SYNC_FLUSH_COMMANDS_BIT = 0x0001,
+  HD_GL_WAIT_FAILED = 0x911D,
 };
 
 #define HD_GL_FUNCS(X) \
@@ -127,7 +139,16 @@ enum {
   X(void, Disable, (GLenum)) \
   X(void, Enable, (GLenum)) \
   X(void, Finish, (void)) \
-  X(void, BlendFunc, (GLenum, GLenum))
+  X(void, BlendFunc, (GLenum, GLenum)) \
+  X(void, GenBuffers, (GLsizei, GLuint *)) \
+  X(void, DeleteBuffers, (GLsizei, const GLuint *)) \
+  X(void, BindBuffer, (GLenum, GLuint)) \
+  X(void, BufferData, (GLenum, GLsizeiptr, const void *, GLenum)) \
+  X(void *, MapBufferRange, (GLenum, GLintptr, GLsizeiptr, GLbitfield)) \
+  X(GLboolean, UnmapBuffer, (GLenum)) \
+  X(GLsync, FenceSync, (GLenum, GLbitfield)) \
+  X(GLenum, ClientWaitSync, (GLsync, GLbitfield, GLuint64)) \
+  X(void, DeleteSync, (GLsync))
 
 #if defined(_WIN32)
 #define HD_APIENTRY __stdcall
@@ -146,7 +167,9 @@ enum {
   kPassCompose, kPassDeblock, kPassPresent, kPassOverlay, kPassNative,
   kPassCount
 };
-enum { kInputSets = 3, kAtlasTilesPerRow = 256 };
+/* Six input sets: with vblank-paced swaps the GPU can run a few frames
+ * behind, and an upload into a set it still reads would stall. */
+enum { kInputSets = 6, kAtlasTilesPerRow = 256 };
 
 typedef struct HdTarget {
   GLuint texture, framebuffer;
@@ -167,6 +190,8 @@ static int s_native_width, s_native_height;
 static uint64_t s_atlas_generation;
 static int s_atlas_scale;
 static HdTarget s_target, s_deblocked;
+static char s_header[160];
+static int s_last_set;
 static int s_max_texture;
 
 static const char *const kVertex =
@@ -183,6 +208,7 @@ static const char *const kVertex =
 /* Compose: one HD subpixel per fragment (see dkc1_hd.c for the encoding
  * and FinishColor for the arithmetic it mirrors). */
 static const char *const kCompose =
+    "#ifndef VARIANT\n#define VARIANT 0\n#endif\n"
     "uniform highp usampler2D gtex;\n"
     "uniform highp usampler2D linetex;\n"
     "uniform highp usampler2D atlas;\n"
@@ -196,6 +222,9 @@ static const char *const kCompose =
     "  return rgb15(texelFetch(linetex, ivec2(int(i & 255u), y), 0).r);\n"
     "}\n"
     "uvec2 texel(uint ref, int u, int v) {\n"
+    "#if VARIANT == 5\n"
+    "  return uvec2(0x12u, 128u);\n"
+    "#endif\n"
     "  int sh = dims.x, s = 1 << sh;\n"
     "  uint t = ref & kNoTile;\n"
     "  int col = int((ref >> 17) & 7u), row = int((ref >> 20) & 7u);\n"
@@ -210,6 +239,9 @@ static const char *const kCompose =
     "}\n"
     "vec3 blend(uvec2 t, uint base, vec3 under, int y) {\n"
     "  uint i = t.r >> 4, j = t.r & 15u;\n"
+    "#if VARIANT == 4\n"
+    "  return i == 0u ? under : cgram(y, base | i);\n"
+    "#endif\n"
     "  float w = float(t.g) / 255.0;\n"
     "  vec3 a = i == 0u ? under : cgram(y, base | i);\n"
     "  vec3 b = j == 0u ? under : cgram(y, base | j);\n"
@@ -230,6 +262,10 @@ static const char *const kCompose =
     "  ivec2 p = ivec2(gl_FragCoord.xy);\n"
     "  int nx = p.x >> sh, ny = p.y >> sh, u = p.x & (s - 1), v = p.y & (s - 1);\n"
     "  uvec4 g = texelFetch(gtex, ivec2(nx, ny), 0);\n"
+    "#if VARIANT == 2\n"
+    "  color = vec4(float(g.w & 255u) / 255.0, 0.0, 0.0, 1.0);\n"
+    "  return;\n"
+    "#endif\n"
     "  uint mode = (g.z >> 27) & 3u;\n"
     "  if (mode == 1u) {\n"
     "    color = vec4(float((g.w >> 16) & 255u), float((g.w >> 8) & 255u),\n"
@@ -245,9 +281,12 @@ static const char *const kCompose =
     "  vec3 m = (g.x & kNoTile) != kNoTile\n"
     "      ? blend(texel(g.x, u, v), base_of(main_index, g.x), below, ny)\n"
     "      : main_native;\n"
+    "#if VARIANT != 3\n"
     "  if ((g.y & kNoTile) != kNoTile)\n"
     "    m = blend(texel(g.y, u, v), cover_base, m, ny);\n"
+    "#endif\n"
     "  if ((flags & 4u) != 0u) m = vec3(0.0);\n"
+    "#if VARIANT != 3\n"
     "  if ((flags & 8u) != 0u) {\n"
     "    vec3 sub = (flags & 64u) != 0u\n"
     "        ? rgb15(texelFetch(linetex, ivec2(256, ny), 0).r)\n"
@@ -257,6 +296,7 @@ static const char *const kCompose =
     "    m = (flags & 16u) != 0u ? max(m - sub, vec3(0.0)) : m + sub;\n"
     "    if ((flags & 32u) != 0u) m = halve(m);\n"
     "  }\n"
+    "#endif\n"
     "  m = min(m, vec3(31.0));\n"
     "  float bright = float(texelFetch(linetex, ivec2(257, ny), 0).r);\n"
     "  color = vec4(floor(expand5(m.r) * bright / 15.0),\n"
@@ -272,32 +312,35 @@ static const char *const kDeblock =
     "uniform sampler2D srctex;\n"
     "uniform ivec4 dims;  /* log2 scale, native width, native height, 0 */\n"
     "out vec4 color;\n"
-    "ivec3 at(int x, int y) {\n"
-    "  return ivec3(floor(texelFetch(srctex, ivec2(x, y), 0).rgb * 255.0 + 0.5));\n"
+    "vec3 at(int x, int y) {\n"
+    "  return floor(texelFetch(srctex, ivec2(x, y), 0).rgb * 255.0 + 0.5);\n"
     "}\n"
-    "ivec3 ramp(ivec3 d, int i, int n) {\n"
-    "  ivec3 m = abs(d) * (n - i) / (2 * n + 1);\n"
-    "  return ivec3(d.x < 0 ? -m.x : m.x, d.y < 0 ? -m.y : m.y,\n"
-    "               d.z < 0 ? -m.z : m.z);\n"
+    "/* Ramp's d * (n - i) / (2n + 1) truncated toward zero, without integer\n"
+    " * division (emulated, and very slow, on the Switch's Maxwell GPU): the\n"
+    " * product is a whole number below 2^11 and inv = 1 / (2n + 1) with\n"
+    " * 2n + 1 <= 9, so the bias keeps floor exact. */\n"
+    "vec3 ramp(vec3 d, float steps, float inv) {\n"
+    "  return sign(d) * floor(abs(d) * steps * inv + 1e-3);\n"
     "}\n"
     "void main() {\n"
     "  int sh = dims.x, s = 1 << sh;\n"
     "  ivec2 p = ivec2(gl_FragCoord.xy);\n"
     "  int nx = p.x >> sh, ny = p.y >> sh, u = p.x & (s - 1), v = p.y & (s - 1);\n"
     "  uint z = texelFetch(gtex, ivec2(nx, ny), 0).z;\n"
-    "  ivec3 c = at(p.x, p.y);\n"
+    "  vec3 c = at(p.x, p.y);\n"
     "  if ((z & 0xe4000000u) != 0u) {\n"
     "    int x0 = nx << sh, y0 = ny << sh;\n"
+    "    float inv = 1.0 / float(2 * s + 1);\n"
     "    if ((z & (1u << 29)) != 0u)\n"
-    "      c += ramp(at(x0 + s, p.y) - at(x0 + s - 1, p.y), s - 1 - u, s);\n"
+    "      c += ramp(at(x0 + s, p.y) - at(x0 + s - 1, p.y), float(u + 1), inv);\n"
     "    if ((z & (1u << 31)) != 0u)\n"
-    "      c -= ramp(at(x0, p.y) - at(x0 - 1, p.y), u, s);\n"
+    "      c -= ramp(at(x0, p.y) - at(x0 - 1, p.y), float(s - u), inv);\n"
     "    if ((z & (1u << 30)) != 0u)\n"
-    "      c += ramp(at(p.x, y0 + s) - at(p.x, y0 + s - 1), s - 1 - v, s);\n"
+    "      c += ramp(at(p.x, y0 + s) - at(p.x, y0 + s - 1), float(v + 1), inv);\n"
     "    if ((z & (1u << 26)) != 0u)\n"
-    "      c -= ramp(at(p.x, y0) - at(p.x, y0 - 1), v, s);\n"
+    "      c -= ramp(at(p.x, y0) - at(p.x, y0 - 1), float(s - v), inv);\n"
     "  }\n"
-    "  color = vec4(vec3(clamp(c, 0, 255)) / 255.0, 1.0);\n"
+    "  color = vec4(clamp(c, 0.0, 255.0) / 255.0, 1.0);\n"
     "}\n";
 
 /* Present: the composed frame (or the native frame when `swizzle` is set,
@@ -413,6 +456,7 @@ bool Dkc1HdGpuInit(bool gles) {
       ? "#version 300 es\nprecision highp float;\nprecision highp int;\n"
         "precision highp usampler2D;\nprecision highp sampler2D;\n"
       : "#version 330 core\n";
+  snprintf(s_header, sizeof s_header, "%s", header);
   s_programs[kPassCompose] = Program(header, kCompose, NULL);
   s_programs[kPassDeblock] = Program(header, kDeblock, NULL);
   s_programs[kPassPresent] = Program(header, kPresent, NULL);
@@ -481,6 +525,83 @@ static bool EnsureTarget(HdTarget *target, int w, int h) {
          HD_GL_FRAMEBUFFER_COMPLETE;
 }
 
+/* ---- Per-frame uploads through a ring of pixel buffers -----------------
+ * glTexSubImage2D from client memory goes through the driver's own staging
+ * memory. On the Switch's Mesa that pool is about 13 MB: once a stream of
+ * uploads fills it, the next one waits for the GPU to retire the oldest,
+ * which showed as a 4-7 ms stall in the swap every 10 frames with HD
+ * (1.3 MB a frame) and every 43 without (0.3 MB). Here every upload is
+ * copied into one of kPboRing buffers of our own and the texture is filled
+ * from it on the GPU; a fence per buffer says when it may be rewritten.
+ * DKC1_HD_PBO=0 restores direct uploads. */
+enum { kPboRing = 12 };
+static struct {
+  GLuint buffer;
+  size_t size;
+  GLsync fence;
+} s_pbo[kPboRing];
+static int s_pbo_next;
+static int s_pbo_enabled = -1;
+
+/* Upload rows of `row_bytes` (source rows `pitch_bytes` apart) into the
+ * texture bound to GL_TEXTURE_2D on the active unit. */
+static void SubImage(int w, int h, GLenum format, GLenum type,
+                     const void *data, size_t row_bytes, size_t pitch_bytes,
+                     int align) {
+  if (s_pbo_enabled < 0) {
+    const char *v = getenv("DKC1_HD_PBO");
+    s_pbo_enabled = !(v && *v == '0');
+  }
+  glPixelStorei(HD_GL_UNPACK_ALIGNMENT, align);
+  const size_t bytes = row_bytes * (size_t)h;
+  if (s_pbo_enabled) {
+    const int slot = s_pbo_next;
+    s_pbo_next = (s_pbo_next + 1) % kPboRing;
+    if (s_pbo[slot].fence) {
+      /* Normally long signaled: the ring holds several frames. */
+      glClientWaitSync(s_pbo[slot].fence, HD_GL_SYNC_FLUSH_COMMANDS_BIT,
+                       1000000000ull);
+      glDeleteSync(s_pbo[slot].fence);
+      s_pbo[slot].fence = NULL;
+    }
+    if (!s_pbo[slot].buffer)
+      glGenBuffers(1, &s_pbo[slot].buffer);
+    glBindBuffer(HD_GL_PIXEL_UNPACK_BUFFER, s_pbo[slot].buffer);
+    if (s_pbo[slot].size < bytes) {
+      glBufferData(HD_GL_PIXEL_UNPACK_BUFFER, (GLsizeiptr)bytes, NULL,
+                   HD_GL_STREAM_DRAW);
+      s_pbo[slot].size = bytes;
+    }
+    uint8_t *map = glMapBufferRange(
+        HD_GL_PIXEL_UNPACK_BUFFER, 0, (GLsizeiptr)bytes,
+        HD_GL_MAP_WRITE_BIT | HD_GL_MAP_INVALIDATE_BUFFER_BIT |
+            HD_GL_MAP_UNSYNCHRONIZED_BIT);
+    if (map) {
+      if (pitch_bytes == row_bytes) {
+        memcpy(map, data, bytes);
+      } else {
+        for (int y = 0; y < h; y++)
+          memcpy(map + (size_t)y * row_bytes,
+                 (const uint8_t *)data + (size_t)y * pitch_bytes, row_bytes);
+      }
+      glUnmapBuffer(HD_GL_PIXEL_UNPACK_BUFFER);
+      glTexSubImage2D(HD_GL_TEXTURE_2D, 0, 0, 0, w, h, format, type, NULL);
+      glBindBuffer(HD_GL_PIXEL_UNPACK_BUFFER, 0);
+      s_pbo[slot].fence = glFenceSync(HD_GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+      return;
+    }
+    glBindBuffer(HD_GL_PIXEL_UNPACK_BUFFER, 0);
+    s_pbo_enabled = 0;
+    fprintf(stderr, "[hd-gpu] buffer mapping failed; direct uploads\n");
+  }
+  const int row_pixels = (int)(pitch_bytes / (row_bytes / (size_t)w));
+  if (pitch_bytes != row_bytes)
+    glPixelStorei(HD_GL_UNPACK_ROW_LENGTH, row_pixels);
+  glTexSubImage2D(HD_GL_TEXTURE_2D, 0, 0, 0, w, h, format, type, data);
+  if (pitch_bytes != row_bytes)
+    glPixelStorei(HD_GL_UNPACK_ROW_LENGTH, 0);
+}
+
 /* Pack tiles in rows of kAtlasTilesPerRow, one RG8UI texture (byte 0 =
  * i << 4 | j, byte 1 = weight; see dkc1_hd.c). */
 static bool UploadAtlas(const Dkc1HdGpuInputs *in) {
@@ -536,11 +657,8 @@ static void UploadNative(const uint32_t *pixels, int w, int h, size_t pitch) {
   }
   glBindTexture(HD_GL_TEXTURE_2D, s_native);
   TextureParameters(false);
-  glPixelStorei(HD_GL_UNPACK_ALIGNMENT, 4);
-  glPixelStorei(HD_GL_UNPACK_ROW_LENGTH, (GLint)pitch);
-  glTexSubImage2D(HD_GL_TEXTURE_2D, 0, 0, 0, w, h, HD_GL_RGBA,
-                  HD_GL_UNSIGNED_BYTE, pixels);
-  glPixelStorei(HD_GL_UNPACK_ROW_LENGTH, 0);
+  SubImage(w, h, HD_GL_RGBA, HD_GL_UNSIGNED_BYTE, pixels, (size_t)w * 4,
+           pitch * 4, 4);
 }
 
 static void Bind(int unit, GLuint texture, bool linear) {
@@ -583,22 +701,22 @@ bool Dkc1HdGpuCompose(const Dkc1HdGpuInputs *in) {
    * reading the previous frame's, and uploading over those would stall. */
   const int set = s_input_set;
   s_input_set = (s_input_set + 1) % kInputSets;
+  s_last_set = set;
   glActiveTexture(HD_GL_TEXTURE0 + 0);
   EnsureTexture(&s_g[set], &s_g_width[set], &s_g_height[set], in->width,
                 in->height, HD_GL_RGBA32UI, HD_GL_RGBA_INTEGER,
                 HD_GL_UNSIGNED_INT);
   glBindTexture(HD_GL_TEXTURE_2D, s_g[set]);
-  glPixelStorei(HD_GL_UNPACK_ALIGNMENT, 4);
-  glTexSubImage2D(HD_GL_TEXTURE_2D, 0, 0, 0, in->width, in->height,
-                  HD_GL_RGBA_INTEGER, HD_GL_UNSIGNED_INT, in->g);
+  SubImage(in->width, in->height, HD_GL_RGBA_INTEGER, HD_GL_UNSIGNED_INT,
+           in->g, (size_t)in->width * 16, (size_t)in->width * 16, 4);
   glActiveTexture(HD_GL_TEXTURE0 + 1);
   EnsureTexture(&s_lines[set], &s_lines_width[set], &s_lines_height[set],
                 kDkc1HdGpuLineStride, in->height, HD_GL_R16UI,
                 HD_GL_RED_INTEGER, HD_GL_UNSIGNED_SHORT);
   glBindTexture(HD_GL_TEXTURE_2D, s_lines[set]);
-  glPixelStorei(HD_GL_UNPACK_ALIGNMENT, 2);
-  glTexSubImage2D(HD_GL_TEXTURE_2D, 0, 0, 0, kDkc1HdGpuLineStride, in->height,
-                  HD_GL_RED_INTEGER, HD_GL_UNSIGNED_SHORT, in->lines);
+  SubImage(kDkc1HdGpuLineStride, in->height, HD_GL_RED_INTEGER,
+           HD_GL_UNSIGNED_SHORT, in->lines, kDkc1HdGpuLineStride * 2,
+           kDkc1HdGpuLineStride * 2, 2);
 
   /* Target first: creating it binds it on the active unit, which must not
    * displace an input bound below. */
@@ -632,6 +750,102 @@ bool Dkc1HdGpuCompose(const Dkc1HdGpuInputs *in) {
     s_last = &s_deblocked;
   }
   return glGetError() == HD_GL_NO_ERROR;
+}
+
+/* ---- On-device profile (Switch bench mode) ------------------------------
+ * Times each stage of one frame's GPU work with glFinish around repeated
+ * draws, including cut-down compose shaders, so a single run on the console
+ * shows where the GPU time goes. Call after Dkc1HdGpuCompose; it redraws
+ * that frame's compose and deblock last, so the result is unchanged. */
+static double ProfileNow(void) {
+  return (double)SDL_GetPerformanceCounter() * 1000.0 /
+         (double)SDL_GetPerformanceFrequency();
+}
+
+static void DrawCompose(GLuint program, const Dkc1HdGpuInputs *in) {
+  Bind(0, s_g[s_last_set], false);
+  Bind(1, s_lines[s_last_set], false);
+  Bind(2, s_atlas, false);
+  glBindFramebuffer(HD_GL_FRAMEBUFFER, s_target.framebuffer);
+  glViewport(0, 0, s_target.width, s_target.height);
+  glUseProgram(program);
+  glUniform4i(glGetUniformLocation(program, "dims"), Log2Scale(in->scale),
+              in->width, in->height, 0);
+  glUniform1i(glGetUniformLocation(program, "flip_uv"), 0);
+  glDrawArrays(HD_GL_TRIANGLE_STRIP, 0, 4);
+}
+
+static void DrawDeblock(const Dkc1HdGpuInputs *in) {
+  Bind(0, s_g[s_last_set], false);
+  Bind(5, s_target.texture, false);
+  glBindFramebuffer(HD_GL_FRAMEBUFFER, s_deblocked.framebuffer);
+  glViewport(0, 0, s_deblocked.width, s_deblocked.height);
+  const GLuint deblock = s_programs[kPassDeblock];
+  glUseProgram(deblock);
+  glUniform4i(glGetUniformLocation(deblock, "dims"), Log2Scale(in->scale),
+              in->width, in->height, 0);
+  glUniform1i(glGetUniformLocation(deblock, "flip_uv"), 0);
+  glDrawArrays(HD_GL_TRIANGLE_STRIP, 0, 4);
+}
+
+int Dkc1HdGpuProfile(const Dkc1HdGpuInputs *in, int view_width,
+                     int view_height, char *out, size_t out_size) {
+  enum { kReps = 8, kVariants = 6 };
+  static GLuint variants[kVariants];
+  if (!s_ready || !in || !s_target.texture || !out)
+    return 0;
+  static const char *const kNames[kVariants] = {
+    "full", "", "gfetch", "mainonly", "noblend", "noatlas"};
+  for (int v = 2; v < kVariants; v++) {
+    if (!variants[v]) {
+      char header[200];
+      snprintf(header, sizeof header, "%s#define VARIANT %d\n", s_header, v);
+      variants[v] = Program(header, kCompose, NULL);
+    }
+  }
+  variants[0] = s_programs[kPassCompose];
+  glDisable(HD_GL_BLEND);
+  glBindVertexArray(s_vao);
+  size_t used = 0;
+  #define PROFILE(label, body) do { \
+    glFinish(); \
+    const double t0 = ProfileNow(); \
+    for (int r = 0; r < kReps; r++) { body; } \
+    glFinish(); \
+    const double ms = (ProfileNow() - t0) / kReps; \
+    int n = snprintf(out + used, out_size - used, " %s%.2f", label, ms); \
+    if (n > 0 && (size_t)n < out_size - used) used += (size_t)n; \
+  } while (0)
+  PROFILE("upload", {
+    glActiveTexture(HD_GL_TEXTURE0 + 0);
+    glBindTexture(HD_GL_TEXTURE_2D, s_g[s_last_set]);
+    glPixelStorei(HD_GL_UNPACK_ALIGNMENT, 4);
+    glTexSubImage2D(HD_GL_TEXTURE_2D, 0, 0, 0, in->width, in->height,
+                    HD_GL_RGBA_INTEGER, HD_GL_UNSIGNED_INT, in->g);
+    glActiveTexture(HD_GL_TEXTURE0 + 1);
+    glBindTexture(HD_GL_TEXTURE_2D, s_lines[s_last_set]);
+    glPixelStorei(HD_GL_UNPACK_ALIGNMENT, 2);
+    glTexSubImage2D(HD_GL_TEXTURE_2D, 0, 0, 0, kDkc1HdGpuLineStride,
+                    in->height, HD_GL_RED_INTEGER, HD_GL_UNSIGNED_SHORT,
+                    in->lines);
+  });
+  for (int v = 0; v < kVariants; v++) {
+    if (v == 1 || !variants[v])
+      continue;
+    PROFILE(kNames[v], DrawCompose(variants[v], in));
+  }
+  if (s_deblocked.texture)
+    PROFILE("deblock", DrawDeblock(in));
+  PROFILE("clear", Dkc1HdGpuClearScreen(0, view_width, view_height));
+  PROFILE("present", PresentTexture(s_target.texture, s_target.width,
+                                    s_target.height, false, 0, 0, 0,
+                                    view_width, view_height));
+  #undef PROFILE
+  /* Leave the frame as Dkc1HdGpuCompose made it. */
+  DrawCompose(s_programs[kPassCompose], in);
+  if (in->deblock && s_deblocked.texture)
+    DrawDeblock(in);
+  return (int)used;
 }
 
 void Dkc1HdGpuPresent(unsigned framebuffer, int vx, int vy, int vw, int vh) {
@@ -669,11 +883,8 @@ void Dkc1HdGpuPresentOverlay(const uint32_t *pixels, int w, int h,
   }
   glBindTexture(HD_GL_TEXTURE_2D, s_overlay);
   TextureParameters(false);
-  glPixelStorei(HD_GL_UNPACK_ALIGNMENT, 4);
-  glPixelStorei(HD_GL_UNPACK_ROW_LENGTH, (GLint)pitch);
-  glTexSubImage2D(HD_GL_TEXTURE_2D, 0, 0, 0, w, h, HD_GL_RGBA,
-                  HD_GL_UNSIGNED_BYTE, pixels);
-  glPixelStorei(HD_GL_UNPACK_ROW_LENGTH, 0);
+  SubImage(w, h, HD_GL_RGBA, HD_GL_UNSIGNED_BYTE, pixels, (size_t)w * 4,
+           pitch * 4, 4);
   glBindFramebuffer(HD_GL_FRAMEBUFFER, framebuffer);
   glViewport(vx, vy, vw, vh);
   glUseProgram(s_programs[kPassOverlay]);
@@ -736,6 +947,14 @@ void Dkc1HdGpuShutdown(void) {
   memset(s_g_height, 0, sizeof s_g_height);
   memset(s_lines_width, 0, sizeof s_lines_width);
   memset(s_lines_height, 0, sizeof s_lines_height);
+  for (int i = 0; i < kPboRing; i++) {
+    if (s_pbo[i].fence)
+      glDeleteSync(s_pbo[i].fence);
+    if (s_pbo[i].buffer)
+      glDeleteBuffers(1, &s_pbo[i].buffer);
+  }
+  memset(s_pbo, 0, sizeof s_pbo);
+  s_pbo_next = 0;
   GLuint textures[] = {s_native, s_atlas, s_overlay};
   glDeleteTextures(3, textures);
   s_native = s_atlas = s_overlay = 0;

@@ -984,3 +984,19 @@ individual environment overrides. It does not apply while the pause panel is
 open. Public bundles have no `LSEnvironment`; clean-user defaults remain off.
 `DKC1_BUILD_DIR` optionally selects an isolated `build_macos.sh` output tree
 so packaging does not remove a running playtest bundle.
+
+## 1.0.3 additions
+
+- `DKC1_HD_PPM_SEQUENCE=1` writes the HD frame next to each
+  `DKC1_FRAME_PPM_PREFIX` frame (`<prefix>_hd_N.ppm`), for HD-vs-native
+  sprite and seam comparisons over a whole replay.
+- `DKC1_DRAW_TIMES=<path>` logs, per frame, the PPU draw time and its HD
+  part in microseconds.
+- Switch bench mode (`bench.flag`, see `docs/SWITCH.md`) replays the
+  40-entrance cases on the console and logs frame times, a GPU stage
+  profile and a WRAM hash per case; the hash is compared with a desktop
+  replay of the same state and input to prove the console runs the same
+  game.
+- `DKC1_PPU_BANDS`, `DKC1_HD_PBO=0` and `SNESRECOMP_INTERP_LEAN=0` select
+  the performance paths; all three are byte-identical to the reference
+  paths on the 40 entrances.

@@ -171,8 +171,15 @@ class WidescreenRuntimeContractTests(unittest.TestCase):
                "ppu.c").read_text(encoding="utf-8")
 
         self.assertIn("Dkc1WidescreenPresentationBias", game)
-        self.assertIn("g_ppu->hScroll[layer] + presentation_bias", game)
-        self.assertIn("g_ppu->hScroll[layer] - presentation_bias", game)
+        # Every drawn line (sequential or in scanline bands) runs through
+        # RunBiasedLine with the frame's bias, restored after the line.
+        self.assertIn("ppu->hScroll[layer] + bias", game)
+        self.assertIn("ppu->hScroll[layer] - bias", game)
+        self.assertIn(
+            "const int line_bias = extend_world ? presentation_bias : 0;",
+            game)
+        self.assertIn("RunBiasedLine(g_ppu, line, line_bias);", game)
+        self.assertIn("RunBiasedLine(ppu, line, s_band.bias);", game)
         self.assertIn(
             "PpuSetWidescreenPresentationXBias(g_ppu, presentation_bias)",
             game)
@@ -603,9 +610,12 @@ class WidescreenRuntimeContractTests(unittest.TestCase):
         self.assertIn("westRawContinuation, eastRawContinuation", header)
         continuation = source.split(
             "if (layer->rawContinuation && layer->wide)", 1)[1].split(
-                "if (screenX < 0)\n    s_marginStats[layerIndex].westRawFallback",
+                "if (screenX < 0)\n"
+                "    WS_STAT_INC(s_marginStats[layerIndex].westRawFallback)",
                 1)[0]
-        self.assertIn("westRawContinuation++", continuation)
+        self.assertIn(
+            "WS_STAT_INC(s_marginStats[layerIndex].westRawContinuation)",
+            continuation)
         self.assertIn("kWsShadowProvenanceRawContinuation", continuation)
         self.assertNotIn("RawFallback", continuation)
         self.assertIn('"\\\"west_continuation\\\":%llu', trace)

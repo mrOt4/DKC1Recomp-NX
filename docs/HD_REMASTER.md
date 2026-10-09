@@ -625,3 +625,14 @@ Puertas de validación:
   `snesrecomp` queda bajo PolyForm Noncommercial, igual que el framework: el
   mod es gratuito y no puede venderse junto con el framework. La metadata
   estructural derivada de la desensamblación sigue siendo GPL-3.
+
+### Deblock cost on the Switch GPU (1.0.3)
+
+The on-device GPU profile (bench mode, `gpuprof`) showed the deblock pass
+taking 7-12 ms a frame against 0.4-0.6 ms for the whole composition: its
+ramp divided integers, which Maxwell emulates. The pass now multiplies by
+1 / (2n + 1) in float with a 1e-3 bias before `floor`, which is exact for
+these products (whole numbers below 2^11, 2n + 1 <= 9): 0.4 ms on the
+console, and GPU against CPU under Wine is still 0 pixels off by more than
+1 at 2x.
+

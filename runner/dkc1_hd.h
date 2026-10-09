@@ -29,6 +29,13 @@ typedef enum Dkc1HdSource {
   kDkc1HdSourcePack,
 } Dkc1HdSource;
 
+/* The HD worker pool, for other per-frame host work: Width is the number
+ * of threads (the caller included); Run calls task(context, i, Width) once
+ * per thread, i = 0 on the caller, and returns when all have finished. */
+int Dkc1HdParallelWidth(void);
+void Dkc1HdParallelRun(void (*task)(void *context, int index, int count),
+                       void *context);
+
 typedef struct Dkc1HdStats {
   uint64_t frames;
   uint64_t pixels;           /* native pixels examined */

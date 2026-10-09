@@ -1,5 +1,5 @@
 
-# DKC1Recomp-NX 1.0.2
+# DKC1Recomp-NX 1.0.3
 
 [![Support me on Ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/mr0ta)
 
@@ -21,6 +21,11 @@ This fork adds, on top of DKC1Recomp and its Switch port:
 - **Compressed MSU-1 music** (Ogg Vorbis, decoded on its own thread, with
   windowed-sinc resampling).
 - **Widescreen HUD**: banana and lives counters anchored to the screen edges.
+- **1.0.3**: steady 60 fps on Switch with HD and MSU-1 (scanlines drawn on
+  three cores, cheaper GPU passes and uploads, faster SPC uploads),
+  enemies and objects no longer vanish at the right edge of the picture,
+  the lives balloon stays next to its number, and the in-game menu is in
+  English or Spanish.
 
 No ROM, graphics or music are included or distributed.
 

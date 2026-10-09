@@ -49,8 +49,13 @@ Player 1 and 2 autodetect pads in order (a lone pad drives player 1).
 Opening the menu pauses the game; B, R3 or Plus closes it. Settings are
 saved to `sdmc:/switch/dkc1/menu.cfg`.
 
+The menu is in English or Spanish ("Language/Idioma", second item). The
+first launch follows the console language (Spanish for es/es-419, English
+otherwise); the choice is saved as `language=` in `menu.cfg`.
+
 | Item | Effect |
 |---|---|
+| Language/Idioma | English or Spanish menu text |
 | Ranura 1–5 | Save-state slot (`quicksave.state`, `slot2.state` … in `sdmc:/switch/dkc1/`) |
 | Guardar / Cargar estado | Save or load that slot (loading closes the menu) |
 | Rebobinar L / Avanzar R | Hold L to rewind (snapshot every 3 frames, up to 128 MiB), R for 3x speed |
@@ -73,8 +78,9 @@ so Game Genie codes are not supported. Codes are written before every frame.
 
 - **CPU boost.** Horizon runs titles at 1020 MHz; the port always raises
   the CPU to 1785 MHz (the console's own boost rate) through `clkrst`
-  (`pcv` before 8.0.0). The GPU clock is untouched. The rate is re-checked
-  every 5 s, because docking and the HOME menu reset it.
+  (`pcv` before 8.0.0), and asks for the GPU rate retail games use (460.8
+  MHz handheld, 768 MHz docked), never lowering either. The rates are
+  re-checked every 5 s, because docking and the HOME menu reset them.
 - **Threads on their own cores.** Horizon starts every thread on the
   process's default core. The emulation thread is pinned to the first
   usable core and each HD worker to another (`switch_clock.c`).
@@ -101,10 +107,41 @@ Measured on device (HD v2 pack at 2x and MSU-1 on, 168 s of play,
 | GPU composition (`gpu.flag`) | 15–28 ms | no longer the limit |
 | GL upload (`submit`) | 2.4 ms | 1.3–1.5 ms |
 
-What is left: when the game uploads music or samples to the SPC (logos,
-level transitions), that code runs interpreted and emulation costs
-8–13 ms for a moment. In 168 s, 10 seconds (363 frames) went over budget,
-all of them at those moments, with 13 audio gaps.
+### 1.0.3: from periodic stutter to a steady 60 fps
+
+The bench mode below measured all 40 entrances of the widescreen floor on
+the console (handheld, HD 2x, MSU-1 on, 270 counted frames each) and
+located four separate costs:
+
+| Change | Measured effect |
+|---|---|
+| PPU scanlines drawn in three bands, one per core (`DrawLinesInBands`, `dkc1_game.c`) | PPU + capture on the emulation core 9.5 → 6 ms; water levels no longer over budget on every frame |
+| Tile-seam deblock shader without integer division (`kDeblock`) | 7–12 → 0.4 ms of GPU per frame |
+| Per-frame texture uploads through a ring of 12 pixel buffers with fences (`SubImage`, `dkc1_hd_gpu.c`) | the swap no longer stalls 4–7 ms every 10 frames (HD) or 43 frames (native) |
+| Lean interpreter step for APU-port poll loops (`interp_lean_pc`, `interp_bridge.c`) | SPC uploads: emulation 9–11 → 6.5 ms |
+
+Over the 40 entrances, late frames (present interval > 18 ms) went from
+1253 to 161 and frames over 16.7 ms of work from 269 to 56; the slowest
+level averages 59.9 fps. The bands, the uploads and the interpreter step
+are exact: WRAM, VRAM, OAM, audio, the HD G-buffer and the final save
+state are byte-identical to the sequential path on all 40 entrances, and
+the console's WRAM after each case matches the desktop's.
+
+The band split also fixed a latent identity-capture bug: the 16-bit line
+generation wraps every 65535 lines (about 5 s of play), after which a stale
+under/cover entry could pass for a current one. Frames whose generations
+wrap now start from cleared stamps (`PpuIdentityForget`).
+
+### Bench mode
+
+With `bench.flag` in `sdmc:/switch/dkc1/`, the app replays every case of
+`bench/cases.txt` from `bench/<case>.state` with the joypad masks of
+`bench/<case>.inp`, writes per-case frame times, a GPU stage profile
+(`gpuprof`), the frame rate and a WRAM hash to `bench.log`, shows the case
+name in the lower-left corner, then deletes `bench.flag` and quits.
+`bench.flag` may hold `frames=N` and `modes=hd,vsync,gpu,native`. The
+cases are made on the desktop from the HD dump routes (a state at level
+start plus the next 900 frames of input, `DKC1_INPUT_RECORD`).
 
 ## Files written to the SD card
 
@@ -132,12 +169,18 @@ Video, WRAM, OAM and audio hashes are unchanged in 16:9 and 4:3.
 
 In widescreen levels the banana counter and the lives counter sit at the
 screen edges, not inside the centered 256 columns. DKC1 draws them into
-the first OAM slots, ahead of every object, and only while they are shown.
-`Dkc1HudOamPrefix` (`dkc1_game.c`) counts that leading run of HUD sprites
-by their tiles: the spinning banana, the digits and the Kong heads, all in
-the top band. The PPU's HUD OAM shifter then moves the left half to the
-left edge and the right half to the right edge. This is presentation only:
-WRAM, OAM and audio hashes are unchanged.
+low OAM slots, but other objects can take slots ahead of or between them,
+and a level can load the Kong balloon's graphics anywhere in VRAM.
+`Dkc1HudOamMask` (`dkc1_game.c`) therefore finds the counters by place:
+the digits (tiles $60-$7F, palette 0, top band) on the left or right, then
+the icon beside them (the balloon: palette 1 within 40 pixels left of the
+lives digits; the banana: palette 0 within 24 pixels left of the banana
+digits). Each such slot is anchored on its own (`PpuSetWsHudOamMask`), so
+the PPU moves the left counter to the left edge and the right one to the
+right edge, and the presentation bias near a level's ends no longer moves
+them. Pillarboxed scenes (boss arenas, fixed screens) keep the native
+position. This is presentation only: WRAM, OAM and audio hashes are
+unchanged.
 
 ## Audio
 

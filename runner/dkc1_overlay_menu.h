@@ -9,8 +9,18 @@
  * (Switch). It only edits settings and reports actions; the host applies
  * them. The Switch host opens it with Plus + Minus or a right-stick click. */
 
+/* Menu language. kDkc1MenuLanguageAuto (the default when menu.cfg has no
+ * "language" key) is resolved by the host from the console's language. */
+typedef enum Dkc1MenuLanguage {
+  kDkc1MenuLanguageAuto = -1,
+  kDkc1MenuLanguageEnglish = 0,
+  kDkc1MenuLanguageSpanish = 1,
+  kDkc1MenuLanguageCount = 2,
+} Dkc1MenuLanguage;
+
 typedef struct Dkc1MenuSettings {
   int slot;            /* save-state slot, 0..4 */
+  int language;        /* Dkc1MenuLanguage */
   bool rewind;         /* hold L to rewind, R to fast-forward */
   bool msu1;           /* replacement music (applies on restart) */
   bool widescreen;     /* 16:9, else 4:3 (4:3 turns HD off) */
@@ -29,6 +39,17 @@ typedef enum Dkc1MenuAction {
   kDkc1MenuActionChanged,  /* a setting changed: apply and persist */
   kDkc1MenuActionQuit,
 } Dkc1MenuAction;
+
+/* Host-side messages, in the menu's language. */
+typedef enum Dkc1MenuString {
+  kDkc1MenuStringCheatsLoaded,  /* "cheats.txt loaded" */
+  kDkc1MenuStringSavedSlot,     /* "Saved to slot %d" */
+  kDkc1MenuStringSaveFailed,    /* "Save failed, slot %d" */
+  kDkc1MenuStringSlotEmpty,     /* "Slot %d is empty" */
+  kDkc1MenuStringSlow,          /* perf overlay: frames over budget */
+  kDkc1MenuStringCount,
+} Dkc1MenuString;
+const char *Dkc1MenuText(const Dkc1MenuSettings *settings, Dkc1MenuString id);
 
 void Dkc1MenuDefaults(Dkc1MenuSettings *settings);
 /* key=value text file; missing keys keep their defaults. */

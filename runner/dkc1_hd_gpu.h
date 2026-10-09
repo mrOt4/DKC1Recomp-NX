@@ -28,6 +28,11 @@ void Dkc1HdGpuPresentOverlay(const uint32_t *pixels, int width, int height,
 /* Clear the whole framebuffer to black: what a narrower picture (4:3, a
  * resized viewport) leaves around itself must not keep older frames. */
 void Dkc1HdGpuClearScreen(unsigned framebuffer, int width, int height);
+/* Diagnostics (Switch bench): time each GPU stage of the last composed
+ * frame, cut-down compose shaders included, into `out` as " name<ms>"
+ * pairs. Returns the text length (0 when unavailable). */
+int Dkc1HdGpuProfile(const Dkc1HdGpuInputs *inputs, int view_width,
+                     int view_height, char *out, size_t out_size);
 /* Wait for the GPU to finish all submitted work (timing diagnostics). */
 void Dkc1HdGpuFinish(void);
 /* Read the last composed frame back as 0x00RRGGBB rows (verification). */

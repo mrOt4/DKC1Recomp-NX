@@ -74,7 +74,17 @@ fingerprint), `DKC1_WRAM_OUTPUT`/`DKC1_VRAM_OUTPUT` (final memory),
 (+`DKC1_LIFECYCLE_SAMPLE_EVERY_FRAME`), `DKC1_INPUT_RECORD`,
 `DKC1_SESSION_DIR` (checkpoint output), `DKC1_FRAME_PPM*` (frame images),
 `DKC1_AUDIO_PCM`, `DKC1_STATE_TRACE`, `DKC1_STREAM_DEBUG`,
-`DKC1_TRACE_PC` (PC probes on interpreter-tier execution).
+`DKC1_TRACE_PC` (PC probes on interpreter-tier execution),
+`DKC1_HD_PPM_SEQUENCE=1` (with `DKC1_FRAME_PPM_PREFIX`: the HD frame too, as
+`<prefix>_hd_N.ppm`), `DKC1_DRAW_TIMES`=path (per frame: PPU draw and HD
+part, microseconds).
+
+**Performance switches (on by default where noted):** `DKC1_PPU_BANDS`=0/1
+(scanline bands on the HD worker pool; default on Switch only, byte-identical
+to the sequential loop), `DKC1_HD_PBO=0` (direct texture uploads instead of
+the pixel-buffer ring), `SNESRECOMP_INTERP_LEAN=0` (full interpreter step
+for APU-port poll loops too). Switch bench mode: `bench.flag` +
+`bench/cases.txt` in the app folder (see `docs/SWITCH.md`).
 
 **Detectors (integrity, all counted + logged):**
 `DKC1_INVARIANT_MONITOR`=jsonl|1 — 9-verdict cross-subsystem monitor;

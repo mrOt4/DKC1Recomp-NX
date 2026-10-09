@@ -426,3 +426,25 @@ floor remains unpassed because 36 required clean anchors are unavailable.
 ## Coral Capers authored wall seam candidate
 
 The separate default-off `DKC1_WS_WALL_SEAMS=1` capability repairs a verified populated-art junction in the supplied Coral Capers save. It uses a complete matching wall pattern from the same source and changes only the offscreen west column. It is not an expansion of generic empty-cell continuation. See [source evidence, validation, and fresh-entry limits](WIDESCREEN_WALL_SEAM.md).
+
+## Right-margin sprites under a presentation bias (1.0.3)
+
+Symptom (Switch tester, then reproduced on the desktop at Reptile Rumble's
+start): a Slippa walking right vanished well inside the 16:9 picture and
+came back "from nothing" when it turned. The actor stayed allocated and
+moving the whole time (lifecycle trace); only its sprite was missing,
+clipped at a fixed column.
+
+Cause: presentation only. Near a level's left end the picture is shifted
+right by the presentation bias (up to 43), so the visible OAM X range ends
+at 255 + extraRightCur + bias. `PpuDecodeOamX` treated any 9-bit X from
+256 + extraRightCur upward as wrapped off the left edge, so sprites in the
+last `bias` columns decoded to x - 512 and disappeared.
+
+Fix: the wrap threshold includes a positive `wsPresentationXBias`
+(`snesrecomp/runner/src/snes/ppu.c`). Validation: over the 40 bench
+entrances, frames differ only in columns 299-341, where 33 of them had been
+losing sprites (TNT barrels, ropes, carts, enemies); WRAM is unchanged.
+The same bias was also wrongly applied to the anchored HUD sprites, which
+moved with the world; anchored slots now ignore it.
+

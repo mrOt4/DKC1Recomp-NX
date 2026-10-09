@@ -26,8 +26,8 @@ include $(DEVKITPRO)/libnx/switch_rules
 TARGET		:=	dkc1
 BUILD		:=	build-switch
 APP_TITLE	:=	Donkey Kong Country
-APP_AUTHOR	:=	elliotttate and Souldbminer
-APP_VERSION	:=	1.0.2
+APP_AUTHOR	:=	mr0ta
+APP_VERSION	:=	1.0.3
 
 # SD layout: sdmc:/switch/<SWITCH_APP_DIR>/rom.smc (+config, saves).
 SWITCH_APP_DIR	?=	dkc1
@@ -100,7 +100,7 @@ GAME_INCLUDES_EARLY := \
 GAME_INCLUDES_LATE :=
 
 GAME_DEFS := \
-	-DDKC1_RELEASE_VERSION='"1.0.2-switch"' \
+	-DDKC1_RELEASE_VERSION='"1.0.3-switch"' \
 	-DSNESRECOMP_REVERSE_DEBUG=0 \
 	-DSNESRECOMP_EXTERNAL_RAM_ROUTINE_GUARDS=1 \
 	-DSYSTEM_VOLUME_MIXER_AVAILABLE=0 \
